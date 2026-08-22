@@ -24,7 +24,7 @@
 
 import { WINDOW, REFERENCE_PERIOD, COVARIATES } from "./baseline.js";
 import { ROLE_LABEL, actorById, partiesFor, purchaseRows } from "./actors.js";
-import { pct, pts, compact, full, fullMoney } from "./format.js";
+import { pct, pts, compact, full, fullMoney, multiple, share } from "./format.js";
 
 /* ── paper ──────────────────────────────────────────────────────────────── */
 
@@ -201,26 +201,38 @@ function header(doc, s, project, audit, generated) {
   s.gap(4);
 }
 
-function verdict(doc, s, result) {
-  const { audit, cf, observedInside } = result;
+function verdict(doc, s, result, window) {
+  const { audit, cf } = result;
   const line =
     audit.creditsUnsupported > 0
-      ? `${compact(audit.creditsUnsupported)} of ${compact(audit.creditsIssued)} credits are not supported by satellite evidence.`
+      ? `The satellite record does not support ${compact(audit.creditsUnsupported)} of ${compact(audit.creditsIssued)} credits issued.`
       : "The claimed baseline is consistent with what comparable land actually did.";
 
-  s.text(line, { size: 13.5, style: "bold", color: onPaper(audit.band.color), lead: 1.28 });
+  // The headline figure, at the size it carries on screen. A reader holding the
+  // PDF beside the panel is meant to be checking the same number twice.
+  const mult = multiple(audit.overstatementMultiple);
+  s.need(20);
+  s.text(mult ? "CLAIM OVERSTATED BY" : "WHAT THE RECORD SHOWS", { size: 6.6, color: INK2 });
+  s.gap(0.6);
+  s.text(mult ?? "No forest saved", {
+    size: mult ? 30 : 15, style: "bold", color: onPaper(audit.supportBand.color), lead: 1.05,
+  });
+  s.gap(2.2);
+
+  s.text(line, { size: 11, style: "bold", lead: 1.28 });
   s.gap(1.4);
   s.text(
-    `Over ${WINDOW[0]}–${WINDOW[1]}, measured against ${cf.n} comparable unprotected parcels. ` +
-      `The project's own area lost ${pct(observedInside)}.`,
+    `Over ${window[0]}–${window[1]}, measured against ${cf.n} comparable unprotected parcels. ` +
+      `Comparable land lost ${pct(audit.independent, 2)}; the project's own ground lost ` +
+      `${pct(audit.observedInside, 2)}. Flagged for field verification.`,
     { size: 8.4, color: INK2 }
   );
   s.gap(4);
 
   const cells = [
-    { k: "Project's baseline", v: pct(audit.claimed), c: LOSS },
-    { k: "Independent estimate", v: pct(audit.independent), c: CONTROL },
-    { k: "Discrepancy", v: pts(audit.discrepancyPts), c: onPaper(audit.band.color) },
+    { k: "Claimed without the project", v: pct(audit.claimed), c: LOSS },
+    { k: "Benefit the record supports", v: pts(audit.realBenefit * 100), c: CONTROL },
+    { k: "Additionality", v: share(audit.additionality), c: onPaper(audit.supportBand.color) },
   ];
   const cw = W / 3;
   s.need(17);
@@ -241,7 +253,7 @@ function verdict(doc, s, result) {
   s.gap(3);
 }
 
-function mapBlock(doc, s, mapImage, year) {
+function mapBlock(doc, s, mapImage, year, sourceLabel, lossLabel) {
   s.heading("The evidence on the ground");
   if (!mapImage?.dataUrl) {
     s.text(
@@ -271,7 +283,7 @@ function mapBlock(doc, s, mapImage, year) {
   const keys = [
     { c: PROJECT, t: "project boundary" },
     { c: CONTROL, t: "comparable parcels" },
-    { c: LOSS, t: "forest cleared by " + year },
+    { c: LOSS, t: lossLabel ?? "forest cleared by " + year },
   ];
   let kx = X;
   doc.setFont("helvetica", "normal");
@@ -285,8 +297,7 @@ function mapBlock(doc, s, mapImage, year) {
   }
   s.y += 5;
   s.text(
-    `Sentinel-2 cloudless imagery by EOX. Clearing polygons are INPE PRODES, tagged with the year ` +
-      `they were detected and shown to ${year}.`,
+    `Sentinel-2 cloudless imagery by EOX. Forest loss is measured from ${sourceLabel}, shown to ${year}.`,
     { size: 7.4, color: INK3 }
   );
   s.gap(1);
@@ -346,7 +357,7 @@ function chart(doc, s, timeline, year) {
     doc.rect(X, s.y, W, 11.5, "FD");
     s.y += 2.6;
     s.text(
-      `Detectable from ${timeline.firstFlagYear} — ${timeline.yearsOfWarning} years before the window ` +
+      `Detectable from ${timeline.firstFlagYear}, ${timeline.yearsOfWarning} years before the window ` +
         `closed, while credits were still being issued and retired.`,
       { size: 8.2, color: "#6b5310", x: X + 3, width: W - 6 }
     );
@@ -358,7 +369,7 @@ function chart(doc, s, timeline, year) {
 function exposure(doc, s, audit) {
   s.heading("Exposure");
   const cells = [
-    { k: "Credits not supported", v: full(audit.creditsUnsupported) },
+    { k: "Credits unsupported", v: full(audit.creditsUnsupported) },
     { k: `At $${audit.pricePerCredit.toFixed(2)} a credit`, v: fullMoney(audit.valueUnsupported) },
   ];
   const cw = W / 2;
@@ -378,12 +389,14 @@ function exposure(doc, s, audit) {
   });
   s.y += 15;
   s.gap(2);
-  s.text(
-    `${full(audit.creditsRetired)} of the ${full(audit.creditsIssued)} credits issued are already retired ` +
-      `against buyers' targets and cannot be reversed.`,
-    { size: 8.2, color: INK2 }
-  );
-  s.gap(1);
+  if (audit.creditsRetired != null) {
+    s.text(
+      `${full(audit.creditsRetired)} of the ${full(audit.creditsIssued)} credits issued are already retired ` +
+        `against buyers' targets and cannot be reversed.`,
+      { size: 8.2, color: INK2 }
+    );
+    s.gap(1);
+  }
 }
 
 /**
@@ -503,31 +516,34 @@ function parties(doc, s, project, record) {
   s.gap(1);
 }
 
-function method(doc, s, result) {
+function method(doc, s, result, window, referencePeriod, sourceLabel, real) {
   s.heading("How this was measured");
   s.text(
     `The project's parcel is described by ${COVARIATES.length} characteristics measured over ` +
-      `${REFERENCE_PERIOD[0]}–${REFERENCE_PERIOD[1]}, before the crediting window opened, so nothing ` +
+      `${referencePeriod[0]}–${referencePeriod[1]}, before the crediting window opened, so nothing ` +
       `about the outcome can leak into the comparison. Unprotected parcels resembling it are then observed ` +
-      `over ${WINDOW[0]}–${WINDOW[1]}. ${result.matches.length} matched from ${result.considered} ` +
+      `over ${window[0]}–${window[1]}. ${result.matches.length} matched from ${result.considered} ` +
       `candidates; parcels within 1.5° are excluded so displaced clearing cannot flatter the result.`,
     { size: 8, color: INK2 }
   );
   s.gap(1.6);
   s.text(
-    "Deforestation is INPE PRODES, the official Brazilian Amazon record. This is a screening estimate " +
+    `Deforestation is measured from ${sourceLabel}. This is a screening estimate ` +
       "from public data. It is not an audit, and it is not a determination about any party.",
     { size: 8, color: INK2 }
   );
   s.gap(1.6);
   s.text(
-    "Project records, company names and credit volumes in this build are illustrative and describe no " +
-      "real party. The deforestation measured under and around the project is real.",
+    real
+      ? "This is a real, registered project. See the case study in the application for sourced facts " +
+        "about its registry status and independent findings."
+      : "Project records, company names and credit volumes in this build are illustrative and describe no " +
+        "real party. The deforestation measured under and around the project is real.",
     { size: 8, style: "bold", color: INK2 }
   );
 }
 
-function footers(doc, project, generated) {
+function footers(doc, project, generated, real) {
   const pages = doc.getNumberOfPages();
   for (let i = 1; i <= pages; i++) {
     doc.setPage(i);
@@ -540,7 +556,7 @@ function footers(doc, project, generated) {
     doc.text(
       safe(
         `Phantom · ${project.name} · generated ${isoDate(generated)} · ` +
-          `illustrative company records, measured forest data`
+          (real ? "real registered project, measured forest data" : "illustrative company records, measured forest data")
       ),
       X,
       PAGE.h - 10.2
@@ -559,9 +575,17 @@ function footers(doc, project, generated) {
  * @param {number}  opts.year      the year the map and the timeline are showing
  * @param {object=} opts.mapImage  { dataUrl, width, height } captured by MapView
  * @param {object=} opts.record    the verification body's portfolio record
+ * @param {number[]} opts.window          [from, to] the outcome window was observed over
+ * @param {number[]} opts.referencePeriod [from, to] the covariates were measured over
+ * @param {string}  opts.sourceLabel      the deforestation data source, for attribution
  * @returns {Promise<string>} the file name written
  */
-export async function downloadReport({ project, result, year, mapImage, record }) {
+export async function downloadReport({
+  project, result, year, mapImage, record,
+  window = WINDOW, referencePeriod = REFERENCE_PERIOD,
+  sourceLabel = "INPE PRODES, the official Brazilian Amazon record",
+  lossLabel,
+}) {
   // Loaded on demand. jsPDF is the largest dependency in the application and
   // most sessions never export anything, so it stays out of the first paint.
   const { jsPDF } = await import("jspdf");
@@ -569,22 +593,23 @@ export async function downloadReport({ project, result, year, mapImage, record }
   const generated = new Date();
   const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait", compress: true });
   const s = sheet(doc);
+  const real = !!project.real;
 
   doc.setProperties({
-    title: `${project.name} — independent baseline verification`,
-    subject: `Baseline verification screening, ${WINDOW[0]}-${WINDOW[1]}`,
+    title: `${project.name}: independent baseline verification`,
+    subject: `Baseline verification screening, ${window[0]}-${window[1]}`,
     creator: "Phantom",
   });
 
   header(doc, s, project, result.audit, generated);
-  verdict(doc, s, result);
-  mapBlock(doc, s, mapImage, year);
+  verdict(doc, s, result, window);
+  mapBlock(doc, s, mapImage, year, sourceLabel, lossLabel);
   chart(doc, s, result.timeline, year);
   exposure(doc, s, result.audit);
   purchases(doc, s, purchaseRows(project));
   parties(doc, s, project, record);
-  method(doc, s, result);
-  footers(doc, project, generated);
+  method(doc, s, result, window, referencePeriod, sourceLabel, real);
+  footers(doc, project, generated, real);
 
   const name = reportFileName(project, generated);
   doc.save(name);

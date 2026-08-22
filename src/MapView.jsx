@@ -21,10 +21,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Map as MapLibreMap, Marker, NavigationControl, ScaleControl, Popup, setWorkerUrl } from "maplibre-gl";
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
-import { REGION, PROJECTS } from "./projects.js";
 import { projectFeature, boundaryLonLat, parcelRing, isRectangularOutline } from "./geometry.js";
 import { purchaseRows, purchaseSummary } from "./actors.js";
-import { lossFraction, WINDOW, REFERENCE_PERIOD } from "./baseline.js";
+import { lossFraction } from "./baseline.js";
 
 setWorkerUrl(maplibreWorkerUrl);
 
@@ -38,8 +37,10 @@ export const COLORS = {
 // 2018 onward; the analysis window opens in 2016, so earlier years borrow the
 // nearest mosaic and the slider says so rather than implying imagery exists
 // that does not.
-export const IMAGERY_YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024];
-export const YEARS = Array.from({ length: WINDOW[1] - WINDOW[0] + 1 }, (_, i) => WINDOW[0] + i);
+export const IMAGERY_YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025];
+
+/** Every year in a [from, to] comparison window, inclusive. */
+export const yearsFor = ([from, to]) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
 
 export const imageryYearFor = (year) =>
   IMAGERY_YEARS.reduce((best, y) => (Math.abs(y - year) < Math.abs(best - year) ? y : best), IMAGERY_YEARS[0]);
@@ -165,21 +166,21 @@ const mercLat = (y) => (360 / Math.PI) * Math.atan(Math.exp((y * Math.PI) / 180)
  * and about a third of a stop of pull-back. Room to move; not so much room that
  * a flick loses the Amazon off the side of the screen.
  */
-function panBarrier(map, camera) {
+function panBarrier(map, camera, region) {
   const rect = map.getContainer().getBoundingClientRect();
   const degPerPx = 360 / (512 * Math.pow(2, camera.zoom));
   const lng = camera.center.lng ?? camera.center[0];
   const lat = camera.center.lat ?? camera.center[1];
   const y = mercY(lat);
 
-  const [[rw, rs], [re, rn]] = REGION.reach;
+  const [[rw, rs], [re, rn]] = region.reach;
   const w = Math.min(rw, lng - (rect.width / 2) * degPerPx);
   const e = Math.max(re, lng + (rect.width / 2) * degPerPx);
   const s = Math.min(rs, mercLat(y - (rect.height / 2) * degPerPx));
   const n = Math.max(rn, mercLat(y + (rect.height / 2) * degPerPx));
 
-  const dx = ((e - w) * REGION.slack) / 2;
-  const dy = ((n - s) * REGION.slack) / 2;
+  const dx = ((e - w) * region.slack) / 2;
+  const dy = ((n - s) * region.slack) / 2;
   return [
     [w - dx, Math.max(-MERC_LIMIT, s - dy)],
     [e + dx, Math.min(MERC_LIMIT, n + dy)],
@@ -209,8 +210,21 @@ const baseStyle = (year) => ({
   ],
 });
 
+// Global Forest Watch's own public tile layer for Hansen tree-cover loss,
+// color-coded by year — live, keyless, verified working. (GFW rebranded to
+// Global Nature Watch in 2025; globalforestwatch.org now redirects there, but
+// this tiles.globalforestwatch.org endpoint is unaffected and still live —
+// re-verified directly rather than assumed.) Used in place of a baked
+// per-year polygon overlay where a region has no equivalent to PRODES's
+// vector WFS (see tools/gfw.mjs). One real limitation, confirmed by testing:
+// this layer ignores year-range query params, so it always shows the full
+// measured record rather than revealing loss up to the slider's year the way
+// the baked Amazon overlay does.
+const GFW_LOSS_TILES = "https://tiles.globalforestwatch.org/umd_tree_cover_loss/latest/dynamic/{z}/{x}/{y}.png";
+
 export default function MapView({
   year, selectedId, onSelect, controls, showControls, showLabels, parcelShapes, lossData, onReady,
+  REGION, PROJECTS, yearWindow, liveClearingTiles,
 }) {
   const ref = useRef(null);
   const mapRef = useRef(null);
@@ -307,6 +321,22 @@ export default function MapView({
       map.addSource("loss-outside", { type: "geojson", data: EMPTY });
       map.addSource("loss-inside", { type: "geojson", data: EMPTY });
 
+      // Live measured-loss tiles, for regions with no baked per-year polygon
+      // overlay. liveClearingTiles is fixed for the lifetime of one mounted
+      // MapView (the app remounts the whole map on a region switch), so this
+      // only needs to be decided once, here.
+      if (liveClearingTiles) {
+        map.addSource("gfw-loss", { type: "raster", tiles: [GFW_LOSS_TILES], tileSize: 256, maxzoom: 12 });
+        map.addLayer({
+          id: "gfw-loss-tiles", type: "raster", source: "gfw-loss",
+          paint: { "raster-opacity": 0.75 },
+          // Starts hidden — it covers the whole visible map rather than one
+          // project's footprint, so it's toggled on only once a project is
+          // selected (see the selectedId effect below).
+          layout: { visibility: selectedId ? "visible" : "none" },
+        });
+      }
+
       // Comparables sit under everything: present, never competing.
       map.addLayer({
         id: "control-fill", type: "fill", source: "controls",
@@ -365,10 +395,16 @@ export default function MapView({
         el.innerHTML = `<i></i><span></span>`;
         el.querySelector("span").textContent = p.shortName ?? p.name;
         const bought = purchaseSummary(p);
-        el.title = bought
-          ? p.name + " — " + bought.credits.toLocaleString("en-US") + " credits bought by " +
+        const recordStatus = p.real === true
+          ? "Real registered project"
+          : "Illustrative project; parties, buyers, claims and credit figures are fictional";
+        const purchaseDetail = bought
+          ? ", " + bought.credits.toLocaleString("en-US") + " credits bought by " +
             bought.buyers + (bought.buyers === 1 ? " company" : " companies") + " in " + bought.region
-          : p.name;
+          : "";
+        el.title = `${recordStatus}: ${p.name}${purchaseDetail}`;
+        el.setAttribute("aria-label", el.title);
+        el.dataset.recordType = p.real === true ? "real" : "illustrative";
         el.addEventListener("click", (e) => { e.stopPropagation(); onSelect(p.id); });
         markers.current.push(new Marker({ element: el }).setLngLat(p.center).addTo(map));
         pins.current.push({ el, lngLat: p.center, w: 0, h: 0 });
@@ -388,7 +424,7 @@ export default function MapView({
           .setLngLat(e.lngLat)
           .setHTML(
             `<div class="pop-title">${esc(p.label || "Comparable parcel")}</div>` +
-              `<div class="pop-row"><span>Lost ${WINDOW[0]}–${WINDOW[1]}</span><b style="color:${COLORS.loss}">${(Number(p.loss) * 100).toFixed(1)}%</b></div>` +
+              `<div class="pop-row"><span>Lost ${yearWindow[0]}–${yearWindow[1]}</span><b style="color:${COLORS.loss}">${(Number(p.loss) * 100).toFixed(1)}%</b></div>` +
               `<div class="pop-row"><span>This project lost</span><b>${(Number(p.projectLoss) * 100).toFixed(1)}%</b></div>` +
               `<div class="pop-row"><span>Similarity</span><b>${Number(p.similarity).toFixed(0)}%</b></div>` +
               `<div class="pop-note">Unprotected · ${
@@ -418,14 +454,18 @@ export default function MapView({
         if (id !== hoveredProject) {
           hoveredProject = id;
           const rows = purchaseRows(project);
-          if (!rows.length) { buyPopup.remove(); return; }
+          const statusNote = project.real === true
+            ? "Real registered project · registry facts are sourced"
+            : "Illustrative project · parties, buyers, baseline claims and credit figures are fictional; forest measurements are real";
           buyPopup.setHTML(
             `<div class="pop-title">${esc(project.name)}</div>` +
               rows.map((r) => `<div class="pop-line">${esc(r.sentence)}</div>`).join("") +
-              `<div class="pop-row"><span>Bought and retired</span><b>${rows
-                .reduce((t, r) => t + r.credits, 0)
-                .toLocaleString("en-US")}</b></div>` +
-              `<div class="pop-note">Company records illustrative · forest data real</div>`
+              (rows.length
+                ? `<div class="pop-row"><span>Bought and retired</span><b>${rows
+                    .reduce((t, r) => t + r.credits, 0)
+                    .toLocaleString("en-US")}</b></div>`
+                : "") +
+              `<div class="pop-note">${statusNote}</div>`
           );
           buyPopup.addTo(map);
         }
@@ -519,7 +559,7 @@ export default function MapView({
     const map = mapRef.current;
     if (!map || !ready.current) return;
     const projectLoss = selectedId
-      ? lossFraction(PROJECTS.find((p) => p.id === selectedId).parcel, WINDOW[0], WINDOW[1])
+      ? lossFraction(PROJECTS.find((p) => p.id === selectedId).parcel, yearWindow[0], yearWindow[1])
       : 0;
 
     const feats = (showControls && controls ? controls : []).map((m) => {
@@ -534,7 +574,7 @@ export default function MapView({
           id: m.cell.id,
           label: m.cell.label,
           similarity: m.similarity,
-          loss: lossFraction(m.cell, WINDOW[0], WINDOW[1]),
+          loss: lossFraction(m.cell, yearWindow[0], yearWindow[1]),
           projectLoss,
           // Which outline this is, so the popup can say so rather than let a
           // drawn shape imply a precision the figures behind it do not have.
@@ -584,7 +624,7 @@ export default function MapView({
     const rebuild = (padding) => {
       map.setMaxBounds(null);
       const camera = map.cameraForBounds(REGION.bounds, { padding });
-      if (camera) map.setMaxBounds(panBarrier(map, camera));
+      if (camera) map.setMaxBounds(panBarrier(map, camera, REGION));
     };
 
     const frame = (duration) => {
@@ -646,6 +686,16 @@ export default function MapView({
     }
     map.setPaintProperty("project-fill", "fill-opacity", selectedId ? 0.06 : 0.1);
     map.setPaintProperty("project-line", "line-width", selectedId ? 2 : 1.4);
+
+    // The live clearing-tile layer (liveClearingTiles regions only) covers
+    // the whole visible map, not just a project's footprint — unlike the
+    // Amazon's baked loss-inside/loss-outside sources, which are only
+    // populated once a project is selected. Left always-on, it renders as a
+    // wall of red across the entire overview. Match the Amazon's behaviour:
+    // hidden until a project is open.
+    if (map.getLayer("gfw-loss-tiles")) {
+      map.setLayoutProperty("gfw-loss-tiles", "visibility", selectedId ? "visible" : "none");
+    }
   }, [selectedId, loaded]);
 
   return <div ref={ref} className="map" />;

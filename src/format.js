@@ -19,3 +19,16 @@ export const money = (n) =>
 export const full = (n) => Math.round(n).toLocaleString("en-US");
 
 export const fullMoney = (n) => "$" + full(n);
+
+/**
+ * An overstatement multiple: how many times larger the claim is than the
+ * benefit the satellite record supports. Rendered "23×" rather than "23.0×"
+ * once it is large enough that the decimal is noise, and never rendered at all
+ * when there is no measurable benefit to divide by — `null` is the caller's
+ * signal to say so in words instead of printing an infinity.
+ */
+export const multiple = (v) =>
+  v == null || !Number.isFinite(v) ? null : (v >= 10 ? Math.round(v) : v.toFixed(1)) + "×";
+
+/** A share as a whole percentage, for figures read as a proportion of a claim. */
+export const share = (v) => (v * 100).toFixed(v > 0 && v < 0.01 ? 1 : 0) + "%";

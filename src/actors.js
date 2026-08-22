@@ -41,11 +41,13 @@ export const ACTORS = [
   { id: "dev-verdanta", role: "developer", name: "Verdanta Carbon Partners", country: "Singapore" },
   { id: "dev-silvabrasa", role: "developer", name: "Silvabrasa Projetos Florestais", country: "Brazil" },
   { id: "dev-aurorabasin", role: "developer", name: "Aurora Basin Forestry", country: "Netherlands" },
+  { id: "dev-zambezihigh", role: "developer", name: "Zambezi Highlands Forestry", country: "South Africa" },
 
   // ── verification bodies ──────────────────────────────────────────────────
   { id: "vvb-aurum", role: "verifier", name: "Aurum Verification Services", country: "United Kingdom" },
   { id: "vvb-northwind", role: "verifier", name: "Northwind Assurance Group", country: "Canada" },
   { id: "vvb-terraline", role: "verifier", name: "Terraline Certification", country: "Switzerland" },
+  { id: "vvb-savanna", role: "verifier", name: "Savanna Assurance Group", country: "South Africa" },
 
   // ── registry ─────────────────────────────────────────────────────────────
   { id: "reg-meridian", role: "registry", name: "Meridian Standard Registry", country: "Switzerland" },
@@ -56,6 +58,10 @@ export const ACTORS = [
   { id: "buy-nordhaven", role: "buyer", name: "Nordhaven Consumer Foods", country: "Denmark" },
   { id: "buy-halbrook", role: "buyer", name: "Halbrook Asset Management", country: "United States" },
   { id: "buy-vantor", role: "buyer", name: "Vantor Energy", country: "Norway" },
+  { id: "buy-solenne", role: "buyer", name: "Solenne Beverages", country: "Netherlands" },
+  { id: "buy-ashford", role: "buyer", name: "Ashford Materials Group", country: "United Kingdom" },
+  { id: "buy-corvine", role: "buyer", name: "Corvine Logistics", country: "South Africa" },
+  { id: "buy-palisade", role: "buyer", name: "Palisade Retail Holdings", country: "United States" },
 ];
 
 export const actorById = (id) => ACTORS.find((a) => a.id === id) ?? null;
@@ -99,6 +105,26 @@ export const PARTIES = {
                buyers: ["buy-nordhaven"] },
   "PJ-5744": { developer: "dev-aurorabasin", verifier: "vvb-terraline", registry: "reg-meridian",
                buyers: ["buy-kestrel", "buy-aeronova"] },
+
+  // Zimbabwe — illustrative projects only. KARIBA-902 is real and deliberately
+  // has no entry here: inventing a developer, verifier or buyer for a real,
+  // currently-controversial project would read as a claim about who actually
+  // bought those credits, which is exactly the line src/caseStudies.js's own
+  // rules draw.
+  "KZ-1100": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-solenne", "buy-corvine"] },
+  "KZ-1173": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-ashford"] },
+  "KZ-1246": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-palisade", "buy-solenne"] },
+  "KZ-1319": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-corvine", "buy-ashford", "buy-palisade"] },
+  "KZ-1392": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-solenne"] },
+  "KZ-1465": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-ashford", "buy-corvine"] },
+  "KZ-1538": { developer: "dev-zambezihigh", verifier: "vvb-savanna", registry: "reg-meridian",
+               buyers: ["buy-palisade"] },
 };
 
 export const partiesFor = (projectId) => PARTIES[projectId] ?? null;

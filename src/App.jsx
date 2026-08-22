@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import MapView, { YEARS, imageryYearFor, UNIFORM_REFERENCE_SHAPES } from "./MapView.jsx";
+import MapView, { yearsFor, imageryYearFor, UNIFORM_REFERENCE_SHAPES } from "./MapView.jsx";
 import YearSlider from "./YearSlider.jsx";
 import { ProjectPanel, ProjectList, Settings } from "./Panels.jsx";
-import { WINDOW } from "./baseline.js";
+import { REGIONS, DEFAULT_REGION_KEY, regionByKey } from "./regions.js";
+import CompanyPage from "./CompanyPage.jsx";
 
 /** Respect a viewer who has asked for less movement: no auto-play for them. */
 const prefersReducedMotion = () =>
@@ -10,8 +11,15 @@ const prefersReducedMotion = () =>
   window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 export default function App() {
+  const [surface, setSurface] = useState(() =>
+    typeof window !== "undefined" && window.location.hash.startsWith("#companies")
+      ? "companies"
+      : "explorer"
+  );
+  const [regionKey, setRegionKey] = useState(DEFAULT_REGION_KEY);
+  const region = regionByKey(regionKey);
   const [selectedId, setSelectedId] = useState(null);
-  const [year, setYear] = useState(WINDOW[1]);
+  const [year, setYear] = useState(region.REGION.window[1]);
   const [playing, setPlaying] = useState(false);
   const [matches, setMatches] = useState(null);
   const [settings, setSettings] = useState(false);
@@ -24,24 +32,34 @@ export default function App() {
   const mapApi = useRef(null);
   const snapshotMap = useCallback(() => mapApi.current?.snapshot() ?? null, []);
 
+  useEffect(() => {
+    const syncSurface = () => setSurface(
+      window.location.hash.startsWith("#companies") ? "companies" : "explorer"
+    );
+    window.addEventListener("hashchange", syncSurface);
+    return () => window.removeEventListener("hashchange", syncSurface);
+  }, []);
+
   // The forest outlines of the comparable parcels, baked once from PRODES.
   // Only used when MapView is drawing measured outlines rather than the one
   // shape language; if the file is absent the map draws the synthetic outline,
-  // which is inscribed in the box the measurement is taken over anyway.
+  // which is inscribed in the box the measurement is taken over anyway. Only
+  // baked for the Amazon pool today.
   useEffect(() => {
-    // Only fetched when the map is actually going to draw them: the file is
-    // several megabytes, and by default every zone is drawn synthetically.
-    if (UNIFORM_REFERENCE_SHAPES) return;
+    if (UNIFORM_REFERENCE_SHAPES || regionKey !== "amazon") return;
     let live = true;
     fetch(`${import.meta.env.BASE_URL}mapdata/parcels.json`)
       .then((r) => (r.ok ? r.json() : null))
       .then((doc) => live && setParcelShapes(doc?.parcels ?? null))
       .catch(() => {});
     return () => { live = false; };
-  }, []);
+  }, [regionKey]);
 
   // Clearing polygons are large and only ever needed for the open project, so
-  // they load on selection rather than up front.
+  // they load on selection rather than up front. Not every region has a baked
+  // overlay (Zimbabwe's clearing is shown as a live tile layer instead — see
+  // MapView.jsx) — a missing file here just means no polygon overlay, handled
+  // gracefully rather than as an error.
   useEffect(() => {
     if (!selectedId) { setLossData(null); return; }
     let live = true;
@@ -57,9 +75,9 @@ export default function App() {
   // sequence, and dropping a viewer at the end of it gives away the ending.
   useEffect(() => {
     setPlaying(false);
-    if (selectedId) setYear(WINDOW[0]);
-    else setYear(WINDOW[1]);
-  }, [selectedId]);
+    if (selectedId) setYear(region.REGION.window[0]);
+    else setYear(region.REGION.window[1]);
+  }, [selectedId, regionKey]);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -80,11 +98,53 @@ export default function App() {
     setYear((prev) => (typeof next === "function" ? next(prev) : next));
   }, []);
 
+  // Switching regions swaps the whole dataset — map, project list, everything
+  // mid-panel — rather than merging a second forest onto the same map. Reset
+  // synchronously in the same handler that changes regionKey rather than via a
+  // separate effect, so MapView never mounts fresh with a stale selectedId
+  // from the region that just left.
+  const switchRegion = useCallback((key) => {
+    if (key === regionKey) return;
+    setRegionKey(key);
+    setSelectedId(null);
+    setMatches(null);
+    setLossData(null);
+    setPlaying(false);
+    setYear(regionByKey(key).REGION.window[1]);
+  }, [regionKey]);
+
   const imageryYear = imageryYearFor(year);
+  const YEARS = yearsFor(region.REGION.window);
+
+  const navigate = (next) => {
+    const hash = next === "companies" ? "#companies" : "#explorer";
+    if (window.location.hash === hash) setSurface(next);
+    else window.location.hash = hash;
+    if (next === "companies") {
+      setSettings(false);
+      setPlaying(false);
+    }
+  };
+
+  const openProjectFromCompany = (projectId, nextRegionKey) => {
+    if (nextRegionKey !== regionKey) switchRegion(nextRegionKey);
+    setSelectedId(projectId);
+    navigate("explorer");
+  };
+
+  if (surface === "companies") {
+    return (
+      <CompanyPage
+        onBack={() => navigate("explorer")}
+        onOpenProject={openProjectFromCompany}
+      />
+    );
+  }
 
   return (
     <div className="app">
       <MapView
+        key={regionKey}
         year={year}
         selectedId={selectedId}
         onSelect={setSelectedId}
@@ -94,6 +154,10 @@ export default function App() {
         parcelShapes={parcelShapes}
         lossData={lossData}
         onReady={(api) => { mapApi.current = api; }}
+        REGION={region.REGION}
+        PROJECTS={region.PROJECTS}
+        yearWindow={region.REGION.window}
+        liveClearingTiles={regionKey === "kariba"}
       />
 
       <header className="topbar">
@@ -102,6 +166,21 @@ export default function App() {
           <span className="brand-sub">independent baseline verification</span>
         </div>
         <div className="spacer" />
+        <button className="explorer-nav-btn" onClick={() => navigate("companies")}>
+          Kariba case
+        </button>
+        <div className="region-switch" role="group" aria-label="Showcase region">
+          {REGIONS.map((r) => (
+            <button
+              key={r.key}
+              className={`region-btn${r.key === regionKey ? " is-active" : ""}`}
+              aria-pressed={r.key === regionKey}
+              onClick={() => switchRegion(r.key)}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
         <button
           className="icon-btn"
           aria-expanded={settings}
@@ -112,7 +191,7 @@ export default function App() {
         </button>
       </header>
 
-      <Settings open={settings} layers={layers} setLayers={setLayers} onClose={() => setSettings(false)} />
+      <Settings open={settings} layers={layers} setLayers={setLayers} onClose={() => setSettings(false)} region={region} />
 
       {selectedId ? (
         <ProjectPanel
@@ -121,9 +200,10 @@ export default function App() {
           onClose={() => setSelectedId(null)}
           onVerified={setMatches}
           snapshotMap={snapshotMap}
+          region={region}
         />
       ) : (
-        <ProjectList onSelect={setSelectedId} />
+        <ProjectList onSelect={setSelectedId} region={region} />
       )}
 
       {selectedId && (
@@ -145,9 +225,17 @@ export default function App() {
       )}
 
       <footer className="footnote">
-        Illustrative project records · real forest data ·{" "}
-        <a href="https://terrabrasilis.dpi.inpe.br" target="_blank" rel="noreferrer">INPE PRODES</a>,{" "}
-        <a href="https://s2maps.eu" target="_blank" rel="noreferrer">Sentinel-2 cloudless by EOX</a>
+        {regionKey === "kariba" ? (
+          <>Real project, sourced case study · real forest data ·{" "}
+            <a href="https://globalnaturewatch.org" target="_blank" rel="noreferrer">Global Nature Watch</a>,{" "}
+            <a href="https://s2maps.eu" target="_blank" rel="noreferrer">Sentinel-2 cloudless by EOX</a>
+          </>
+        ) : (
+          <>Illustrative project records · real forest data ·{" "}
+            <a href="https://terrabrasilis.dpi.inpe.br" target="_blank" rel="noreferrer">INPE PRODES</a>,{" "}
+            <a href="https://s2maps.eu" target="_blank" rel="noreferrer">Sentinel-2 cloudless by EOX</a>
+          </>
+        )}
       </footer>
     </div>
   );

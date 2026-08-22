@@ -208,6 +208,10 @@ const quantile = (sorted, q) => {
 export function counterfactual(matches, window = WINDOW) {
   const losses = matches.map((m) => lossFraction(m.cell, window[0], window[1])).sort((a, b) => a - b);
   return {
+    // Carried so `auditBaseline` can measure the project's own footprint over
+    // exactly the window the controls were observed across. Netting the two
+    // against each other only means anything if both cover the same years.
+    window,
     n: losses.length,
     median: quantile(losses, 0.5),
     p25: quantile(losses, 0.25),
@@ -241,6 +245,25 @@ export const RISK_BANDS = [
 ];
 export const riskBandFor = (percentile) => RISK_BANDS.find((b) => percentile >= b.min);
 
+// ── how much of the claim the record supports ──────────────────────────────
+//
+// Distinct from RISK_BANDS above, which score where a claim sits inside the
+// control distribution. That is a question about the claim's plausibility; this
+// is a question about what the measurements actually support, and the two can
+// disagree sharply. Baixo Xingu claims 14.6% against controls that lost 14.8%,
+// so it sits low in the distribution and bands as "Consistent" — while its own
+// ground lost 13.7%, leaving a benefit of one point against a claim of fifteen.
+// Colouring the overstatement figure from the percentile painted that 14x green.
+
+export const SUPPORT_BANDS = [
+  { key: "unsupported", label: "Not supported", below: 0.001, color: "#e5484d" },
+  { key: "weak", label: "Largely unsupported", below: 0.25, color: "#ee7f2d" },
+  { key: "partial", label: "Partly supported", below: 0.6, color: "#e8b931" },
+  { key: "supported", label: "Supported", below: Infinity, color: "#2fbf71" },
+];
+export const supportBandFor = (additionality) =>
+  SUPPORT_BANDS.find((b) => additionality < b.below) ?? SUPPORT_BANDS.at(-1);
+
 // ── the audit ──────────────────────────────────────────────────────────────
 
 /**
@@ -256,25 +279,41 @@ export function auditBaseline(project, cf) {
 
   // ── the one chain every displayed figure hangs off ──────────────────────
   //
-  // These four lines are the whole comparison, and they are written out in
-  // sequence so the arithmetic is checkable by eye:
+  // A project's credits rest on the gap between what comparable unprotected
+  // land actually lost and what the project's own ground actually lost. That
+  // gap — and nothing larger — is the benefit the project can claim:
   //
-  //   discrepancy      = claimed − independent
-  //   unsupportedShare = discrepancy ÷ claimed
-  //   creditsUnsupported = issued × unsupportedShare
+  //   realBenefit    = comparable land lost − project's own ground lost
+  //   additionality  = realBenefit ÷ claimed
+  //   unsupported    = issued × (1 − additionality)
+  //   overstatement  = claimed ÷ realBenefit
   //
-  // Everything the interface renders derives from here. An earlier build showed
-  // a 16-point discrepancy beside an "avoided deforestation" panel reading
-  // 0.0% against 0.0%, because those two framings were computed independently
-  // and happened to disagree: this project lost more forest than its own
-  // baseline predicted, so its *avoided* figure is zero while its *baseline*
-  // still sits far above what comparable land did. Both were true and together
-  // they read as a bug. The panel now states the baseline comparison only, and
-  // `selfcheck.mjs` asserts the chain holds for every project.
-  const discrepancyPts = (claimed - independent) * 100;
-  const supportedShare = claimed > 0 ? Math.min(1, independent / claimed) : 1;
+  // Measured over the same window on both sides, which is why `cf` carries it.
+  //
+  // The subtraction is the part that used to be missing. An earlier build set
+  // the supported share to independent ÷ claimed, which credited a project for
+  // the whole of what comparable land lost even when its own forest had been
+  // cleared just as fast. Nine of this build's twenty-one projects clear faster
+  // than their controls; for those the honest benefit is not small, it is
+  // absent, and `benefitMeasurable` says so rather than printing a multiple
+  // derived from dividing by a negative number.
+  const observedInside = lossFraction(project.parcel, cf.window[0], cf.window[1]);
+  const realBenefit = independent - observedInside;
+  const benefitMeasurable = realBenefit > 0 && claimed > 0;
+
+  // Clamped into [0, 1]: a project cannot deliver less than none of what it
+  // sold, nor more than all of it, and either end of that would push
+  // `creditsUnsupported` outside the issued volume it is a share of.
+  const additionality = benefitMeasurable ? Math.min(1, realBenefit / claimed) : 0;
+  const overstatementMultiple = benefitMeasurable ? claimed / realBenefit : null;
+  const supportBand = supportBandFor(additionality);
+
+  const supportedShare = additionality;
   const unsupportedShare = 1 - supportedShare;
   const creditsUnsupported = Math.round(project.creditsIssued * unsupportedShare);
+  const pricePerCredit = project.pricePerCredit ?? 5.69;
+
+  const discrepancyPts = (claimed - independent) * 100;
   const ratio = independent > 0 ? claimed / independent : Infinity;
 
   // A buyer wants one number. This is the percentile inverted: 100 means the
@@ -286,6 +325,12 @@ export function auditBaseline(project, cf) {
   return {
     claimed,
     independent,
+    observedInside,
+    realBenefit,
+    benefitMeasurable,
+    additionality,
+    overstatementMultiple,
+    supportBand,
     p25: cf.p25,
     p75: cf.p75,
     controls: cf.n,
@@ -299,8 +344,35 @@ export function auditBaseline(project, cf) {
     creditsUnsupported,
     creditsIssued: project.creditsIssued,
     creditsRetired: project.creditsRetired,
-    pricePerCredit: project.pricePerCredit ?? 5.69,
-    valueUnsupported: creditsUnsupported * (project.pricePerCredit ?? 5.69),
+    pricePerCredit,
+    valueUnsupported: creditsUnsupported * pricePerCredit,
+  };
+}
+
+// ── portfolio roll-up ──────────────────────────────────────────────────────
+
+/**
+ * One total across a set of audits. Value is summed from each project's own
+ * price, not a blended one, so a portfolio reads as the sum of its parts and
+ * a reader can add the rows up by hand and land on the same figure.
+ */
+export function portfolioExposure(audits) {
+  const rows = audits.filter(Boolean);
+  const measurable = rows.filter((a) => a.benefitMeasurable);
+  return {
+    projects: rows.length,
+    // Named separately because "no measurable benefit" is a different statement
+    // from "a small benefit", and averaging the two would hide the distinction.
+    withoutMeasurableBenefit: rows.length - measurable.length,
+    creditsIssued: rows.reduce((t, a) => t + a.creditsIssued, 0),
+    creditsUnsupported: rows.reduce((t, a) => t + a.creditsUnsupported, 0),
+    valueUnsupported: rows.reduce((t, a) => t + a.valueUnsupported, 0),
+    // The worst single multiple carries the headline; projects with no
+    // measurable benefit have no multiple to contribute and are counted above.
+    worstMultiple: measurable.reduce(
+      (worst, a) => (worst === null || a.overstatementMultiple > worst ? a.overstatementMultiple : worst),
+      null
+    ),
   };
 }
 

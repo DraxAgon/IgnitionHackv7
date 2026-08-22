@@ -3,166 +3,190 @@
 **An independent due-diligence layer for forest carbon credits.**
 
 A forest carbon credit is sold against a prediction: how much forest *would* have been lost
-without the project. The project writes that prediction itself, from a reference area it
-chooses. An auditor checks it was done to methodology, and a registry certifies it.
+without the project. The project writes that prediction itself, from a reference area it chooses.
+An auditor checks it was done to methodology, and a registry certifies it. Nobody routinely goes
+back and asks whether comparable forest actually behaved the way the baseline said it would.
 
-Nobody routinely goes back and asks the obvious question:
+Phantom asks that question, from the outside, using public satellite records.
 
-> **Did comparable forest actually behave the way the baseline said it would?**
+---
 
-That question can only be answered years later, with satellite data that did not exist when the
-credits were issued. Phantom asks it continuously — and asks it from the outside.
+## Quick start
 
-```
+```bash
+git clone <your-repo-url>
+cd ignitionhacks-2026
 npm install
-npm run dev        # http://localhost:5173
-npm run check      # dataset + analysis invariants, no network
-npm run build
+npm run dev
 ```
 
-## What it does
+Then open **http://localhost:5173**.
 
-Select a registered forest carbon project, then **Run independent verification**. Phantom:
+That is the whole setup. There are **no API keys, no accounts and no environment variables**.
+Every data source is public and keyless, and all measured data is committed to the repo.
 
-1. **Describes the project's forest** by seven covariates measured over 2008–2015 — *before* the
-   crediting window opens, so nothing about the outcome leaks into the comparison.
-2. **Searches the control pool** for unprotected parcels that resemble it, excluding anything
-   within 1.5° so displaced clearing cannot flatter the result.
-3. **Observes what actually happened** to those parcels over 2016–2023.
-4. **Compares** that against what the project claimed would happen, and against what actually
-   happened inside the project.
-
-The output is not a verdict. It is a discrepancy and a risk band — this is Castanheira Forest
-Reserve, as the shipped data actually reports it:
-
-```
-Project's own baseline              ████████████████████████  32.6%
-Independent counterfactual          █                          1.2%
-Observed loss in the project area                              0.0%
-
-Claimed avoided:      32.6% − 0.0% = 32.6%
-Independent estimate:  1.2% − 0.0% =  1.2%
-
-Discrepancy +31.4 pts · above 96% of 27 comparable parcels · risk SEVERE
-```
-
-Two of the seven projects come back **Consistent**: their baselines match what comparable land
-did. A screening tool that can only accuse is not a screening tool.
-
-### The continuous backtest
-
-The more useful view is the one that runs year by year. A baseline set in 2016 can look
-reasonable in 2016 and become obviously wrong by 2019 — while credits are still being issued and
-retired against it. Phantom tracks the claimed pace against what comparable land actually did, and
-reports the first year the evidence stopped supporting the claim:
-
-> Comparable land was clearing at under half the claimed pace for two consecutive years by 2017.
-> On this evidence the baseline **could have been flagged as high-risk** six years before the end
-> of the crediting window — while credits were still being issued and retired.
-
-That is the claim the tool makes, and it is deliberately bounded. Phantom produces an estimate
-from public data. It does not prove a baseline was wrong, and it makes no finding about any party.
-
-## Who this is for
-
-Buyers. A company spending millions on certified credits currently has one chain of assurance —
-project developer, auditor, registry — and no practical way to sanity-check the assumption the
-whole thing rests on. Phantom is the second opinion they can run *before* the money moves.
-
-That framing matters and it is also the accurate one. A company that bought certified credits in
-good faith did not write the baseline. Nothing in this project accuses a buyer of anything, and
-`validateCaseStudy` enforces that in code.
-
-## What is real and what is illustrative
-
-**Real — all of it measured, none of it modelled:**
+### Requirements
 
 | | |
 |---|---|
-| Deforestation | [INPE PRODES](https://terrabrasilis.dpi.inpe.br) via TerraBrasilis WFS — the official Brazilian Amazon record. Annual clear-cut increments, pre-2008 accumulated clearing, non-forest and hydrography masks, conservation units, indigenous lands. |
-| Terrain, rainfall | [Open-Meteo](https://open-meteo.com) elevation and archive APIs |
-| Imagery | [Sentinel-2 cloudless](https://s2maps.eu) by EOX, 10 m, one mosaic per year 2018–2024 |
-| Place names | CARTO, OpenStreetMap |
+| **Node.js** | 18 or newer (developed on 22.x). Check with `node -v`. |
+| **npm** | 9 or newer, ships with Node. |
+| **Browser** | Any current Chrome, Edge, Firefox or Safari. Needs WebGL for the map. |
+| **Internet** | Needed at runtime for map tiles (satellite imagery and place labels). All analysis data is local. |
 
-Every source is public and keyless. There is no API key anywhere in this repository.
+### Commands
 
-**Illustrative — the claim side only:** project names, registry status, claimed baselines and
-credit volumes. They are not real registry entries and name no real party. They exist so the
-interface can be exercised end to end, and they are chosen to span the risk range.
-
-The deforestation measured *under and around* every project is real, including inside its own
-footprint — `tools/make-projects.mjs` queries PRODES for each project's own boundary.
-
-> The claim is illustrative. The check is real.
-
-## Adding a real project
-
-1. Append a record to `src/projects.js` with the published boundary, registry reference,
-   methodology, start year, claimed baseline and credit volumes.
-2. Write its case study in `src/caseStudies.js` — the container is built and validated, and
-   deliberately empty. Read the rules at the top of that file first; the short version is that
-   every factual claim carries a citation, you report what a named body *determined* rather than
-   what you infer, and buyers are never treated as defendants.
-3. `npm run check` will fail the build if a study is unsourced or uses accusation language.
-
-The control pool currently covers the Brazilian Legal Amazon. A project outside it needs a pool
-collected for its own region — see `tools/collect.mjs`, where the region is a constant.
-
-## Layout
-
-| file | role |
+| Command | What it does |
 |---|---|
-| `src/baseline.js` | matching, counterfactual, audit, backtest. Pure — no React, no I/O, no network. |
-| `src/cells.json` | the control pool, generated |
-| `src/projects.js` | project records, generated |
-| `src/caseStudies.js` | sourced write-ups + the validator. Empty by design. |
-| `tools/collect.mjs` | builds the control pool from public APIs |
-| `tools/make-projects.mjs` | measures each project's own footprint, sets the illustrative claims |
-| `src/report.js` | the panel as a PDF a buyer can send on — same figures, same wording, same map |
-| `src/format.js` | the number formats the panel and the report share, so the two cannot drift |
-| `src/selfcheck.mjs` | asserts the invariants, including that matching cannot read the outcome window |
+| `npm run dev` | Start the dev server on port 5173 |
+| `npm run build` | Production build into `dist/` |
+| `npm run preview` | Serve the production build locally |
+| `npm run check` | Run the data and analysis self-check (no network, no browser) |
 
-Regenerate everything:
+`npm run check` is the fastest way to confirm a working install. It recomputes every project from
+the committed measurements and asserts the invariants the whole argument depends on.
+
+---
+
+## Dependencies
+
+Runtime (`dependencies`):
+
+| Package | Why |
+|---|---|
+| `react`, `react-dom` | UI |
+| `maplibre-gl` | Map rendering, open source, no access token |
+| `@turf/turf` | Geometry: point-in-polygon, area, clipping the clearing data |
+| `jspdf` | Builds the downloadable PDF report in the browser |
+
+Build and dev (`devDependencies`): `vite`, `@vitejs/plugin-react`, and `playwright`, which is used
+only by the screenshot helper in `scripts/` and is not needed to run the app.
+
+### Services used at runtime
+
+None of these require a key.
+
+| Source | Used for |
+|---|---|
+| [Sentinel-2 cloudless](https://s2maps.eu) by EOX | Annual satellite mosaics, 10 m, 2018 to 2025 |
+| [CARTO](https://carto.com) basemaps | Place labels and the dark base layer |
+| OpenStreetMap | Underlying label data |
+
+If tiles fail to load, the analysis panel still works; only the imagery goes blank.
+
+---
+
+## Using it
+
+1. Pick a region, **Amazon** or **Zimbabwe**, in the top bar.
+2. Click a project on the map or in the list.
+3. Press **Run independent verification**. Phantom describes the project's parcel by seven
+   characteristics measured before the crediting window opened, finds unprotected parcels that
+   match, and shows what actually happened to them.
+4. Drag or play the **year slider** to watch recorded clearing appear year by year.
+5. Press **Download PDF** for a shareable report: the verdict, the figures, the map as framed, and
+   who bought the credits.
+6. **Kariba case** in the top bar opens the real, sourced case study.
+
+---
+
+## How the method works
+
+1. **Describe the parcel** by seven covariates measured over the reference period, before the
+   crediting window opens, so nothing about the outcome can leak into the comparison.
+2. **Match** unprotected parcels that resemble it, excluding anything within 1.5 degrees so
+   displaced clearing cannot flatter the result.
+3. **Observe** what actually happened to those parcels over the crediting window.
+4. **Compare** that against what the project claimed, and against what happened inside the project.
+
+The benefit the record supports is the gap between what comparable land lost and what the
+project's own ground lost. Measured against the claim, that gap is its real additionality.
+
+Phantom produces a screening estimate, not an audit. It says a baseline looks unlike what
+comparable land actually did, which is a reason to ask for an explanation before money moves. It
+makes no finding about any party.
+
+---
+
+## What is real and what is illustrative
+
+Real, all measured, none modelled:
+
+| | |
+|---|---|
+| Amazon deforestation | [INPE PRODES](https://terrabrasilis.dpi.inpe.br) via TerraBrasilis, the official Brazilian record |
+| Zimbabwe deforestation | Hansen Global Forest Change via Global Forest Watch |
+| Terrain and rainfall | [Open-Meteo](https://open-meteo.com) |
+| Imagery | Sentinel-2 cloudless by EOX |
+| Kariba case study | Verra, BeZero Carbon, Climate Home News, REDD-Monitor and Quantum Commodity Intelligence, all cited in-app |
+
+Illustrative: every Amazon project's name, parties, buyers, baseline claim and credit volumes.
+They are not real registry entries and they name no real party. Each one is labelled as such in
+the interface.
+
+**Kariba REDD+ (VCS 902) is a real, registered project.** Its registry facts are sourced and cited.
+
+> The claim is illustrative. The measurement is real.
+
+---
+
+## Project structure
 
 ```
-npm run collect     # ~30 min, resumable, caches to .cache/
-npm run projects
+src/
+  App.jsx            top-level state: region, selection, year
+  MapView.jsx        the map, its layers and the year-stepped clearing
+  Panels.jsx         the verification panel and project list
+  CompanyPage.jsx    the Kariba buyer-exposure page
+  baseline.js        matching, counterfactual, audit, backtest (pure, no I/O)
+  report.js          PDF generation
+  cells.json         Amazon control pool, generated
+  cells-kariba.json  Zimbabwe control pool, generated
+  projects.js        project records, generated
+  caseStudies.js     sourced write-ups and their validator
+  selfcheck.mjs      invariant checks, run by npm run check
+public/mapdata/      baked PRODES clearing polygons, one file per project
+tools/               data collectors that call the public APIs
+scripts/             map-data bake and screenshot helpers
+```
+
+### Regenerating the data (optional)
+
+The committed data is enough to run everything. To rebuild it from source:
+
+```bash
+npm run collect                 # Amazon control pool, INPE PRODES + Open-Meteo, ~30 min
+npm run projects                # measure each footprint, set the illustrative claims
+node scripts/bake-map-data.mjs  # clearing polygons for the map
 npm run check
 ```
+
+These call public APIs that rate-limit. Every collector caches to `.cache/` and resumes, so an
+interrupted run costs nothing.
+
+---
 
 ## Limitations
 
 - **Matched controls are not a randomised trial.** Similar-looking land can still differ in ways
-  seven covariates do not capture — land tenure, enforcement, local politics.
-- **The control pool is small, because the Amazon is protected.** Only 73 of 277 parcels fall under
-  25% protected coverage, so a project is typically matched against 13–27 controls, not hundreds.
-  Risk bands are calibrated for that: a percentile cannot exceed (n−1)/n, so with 15 controls the
-  strongest possible reading is 93.
-- **Parcel outlines on the map are drawn, not measured.** Every zone on the map — the project and
-  the parcels it is compared against — is drawn in one shape language, so the two differ by colour
-  rather than by kind. A comparable parcel is drawn as an outline inscribed in its one-degree box,
-  and its figures are summed over that whole box, so the shape understates the ground behind the
-  number rather than overstating it. The popup says so. `UNIFORM_REFERENCE_SHAPES` in `MapView.jsx`
-  switches to the baked PRODES forest outlines instead, at the cost of the map reading as blobs
-  beside rectangles — those outlines are box-clipped, so a parcel with little to subtract comes
-  back as very nearly its box.
-- **Parcel resolution is 1°.** Matching happens parcel-to-parcel so the comparison is like for
-  like; a project's own observed loss is measured on its real footprint, which is finer.
-- **Rainfall is missing.** Open-Meteo's daily quota ran out during collection. The covariate is
-  null throughout and matching simply skips it — re-run `npm run collect` to fill it in.
-- **PRODES is clear-cut deforestation in the Brazilian Amazon.** It does not capture degradation,
-  and it does not exist elsewhere; another region needs another source.
-- **Bounding-box sums count straddling polygons whole.** Parcel areas come from WFS bbox queries,
-  so a large non-forest or water polygon crossing a parcel edge is counted fully on both sides.
-  This slightly understates the forest denominator near such features, which slightly overstates
-  loss *rates*. The error is symmetric across project and controls, so the comparison between them
-  absorbs most of it — but absolute rates should be read as approximate.
-- **Claimed baselines here are illustrative**, so the discrepancies shown are exercises. Only the
-  measured side of every comparison is real.
-- **The observation window ends in 2023**, the last complete PRODES year at time of collection.
+  seven covariates do not capture: land tenure, enforcement, local politics.
+- **The control pool is small, because the Amazon is heavily protected.** Only 73 of 277 parcels
+  fall under 25 percent protected coverage, so a project is matched against roughly 13 to 27
+  controls rather than hundreds.
+- **Parcel resolution is one degree.** Matching runs parcel-to-parcel so the comparison is like
+  for like. A project's own observed loss is measured on its real footprint, which is finer.
+- **PRODES covers clear-cut deforestation in the Brazilian Amazon.** It does not capture
+  degradation, and another region needs another source.
+- **The observation window ends in 2023**, the last complete PRODES year at collection time.
 
-## Not built yet
+## Not built
 
-A forward-looking baseline estimator — projecting expected loss for a project that has *no*
-history to backtest — is a separate extension and is deliberately absent. Everything in this
-repository is observed history.
+A forward-looking baseline estimator, projecting expected loss for a project with no history to
+backtest against, is a separate extension and is deliberately absent. Everything here is observed
+history.
+
+## Attribution
+
+Forest data: INPE PRODES; Hansen, UMD, Google, USGS and NASA via Global Forest Watch (CC BY 4.0).
+Imagery: Sentinel-2 cloudless by EOX. Basemap: CARTO and OpenStreetMap contributors.
+Map rendering: MapLibre GL JS.

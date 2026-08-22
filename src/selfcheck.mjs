@@ -8,8 +8,24 @@ import {
 import { CASE_STUDIES, validateCaseStudy } from "./caseStudies.js";
 import { ACTORS, PARTIES, buildLedger, purchaseRows, verifierRecord } from "./actors.js";
 import { PROJECTS, REGION } from "./projects.js";
+// Case studies can attach to a project in any region, so validation checks
+// against the union of ids — everything else below is deliberately scoped to
+// the Amazon dataset alone, which is what this file was built to check.
+import { PROJECTS as KARIBA_PROJECTS } from "./projects-kariba.js";
 import { parcelRing } from "./geometry.js";
 import { reportFileName } from "./report.js";
+import {
+  BUYER_LEADERBOARD, DEVELOPER_LEADERBOARD, PUBLIC_COMPANIES, validateCompanyData,
+} from "./companyData.js";
+import {
+  REAL_COMPANIES,
+  REAL_PROJECTS,
+  REAL_PROJECT_ACTORS,
+  CREDIT_EXPOSURES,
+  PROJECT_ACTOR_RELATIONSHIPS,
+  CARBON_NETWORK,
+  validateCarbonNetwork,
+} from "./carbonNetwork.js";
 import cellsDoc from "./cells.json" with { type: "json" };
 
 const CELLS = cellsDoc.cells;
@@ -38,6 +54,7 @@ for (const c of CELLS) {
 }
 
 // ── every project is measured, matched and audited ─────────────────────────
+console.log("internal illustrative Forest Explorer project audits");
 console.log("id       project                      claimed  independent  risk        controls  flagged");
 const seen = new Set();
 const bandsHit = new Set();
@@ -92,6 +109,42 @@ for (const p of PROJECTS) {
   const audit = auditBaseline(p, cf);
   assert(audit.creditsUnsupported >= 0 && audit.creditsUnsupported <= p.creditsIssued, `${p.id}: bad credit exposure`);
   assert(audit.percentile >= 0 && audit.percentile <= 100, `${p.id}: bad percentile`);
+
+  // ── the additionality chain ───────────────────────────────────────────────
+  // The headline figure divides by the measured benefit, so the one thing that
+  // must never happen is a multiple printed from a division by zero or by a
+  // negative number. `benefitMeasurable` is what stands between the two.
+  assert(
+    Math.abs(audit.realBenefit - (audit.independent - audit.observedInside)) < 1e-12,
+    `${p.id}: benefit is not comparable-land loss minus the project's own loss`
+  );
+  assert(
+    audit.benefitMeasurable === (audit.realBenefit > 0 && audit.claimed > 0),
+    `${p.id}: benefitMeasurable disagrees with the measurement`
+  );
+  assert(audit.additionality >= 0 && audit.additionality <= 1, `${p.id}: additionality outside [0, 1]`);
+  if (audit.benefitMeasurable) {
+    assert(
+      Number.isFinite(audit.overstatementMultiple) && audit.overstatementMultiple > 0,
+      `${p.id}: measurable benefit but no usable multiple`
+    );
+    assert(
+      Math.abs(audit.overstatementMultiple - audit.claimed / audit.realBenefit) < 1e-9,
+      `${p.id}: multiple is not claimed over benefit`
+    );
+  } else {
+    assert(audit.overstatementMultiple === null, `${p.id}: a multiple was printed with no benefit to divide by`);
+    assert(audit.additionality === 0, `${p.id}: no measurable benefit but additionality is not zero`);
+    assert(audit.creditsUnsupported === p.creditsIssued, `${p.id}: no benefit, so every issued credit is unsupported`);
+  }
+  assert(
+    Math.abs(audit.creditsUnsupported - Math.round(p.creditsIssued * (1 - audit.additionality))) < 1,
+    `${p.id}: unsupported credits are not issued x (1 - additionality)`
+  );
+  assert(
+    Math.abs(audit.valueUnsupported - audit.creditsUnsupported * audit.pricePerCredit) < 1e-6,
+    `${p.id}: unsupported value does not reconcile to credits x price`
+  );
   bandsHit.add(audit.band.key);
 
   const tl = divergenceTimeline(p, matches);
@@ -178,10 +231,9 @@ for (const c of CELLS) {
   console.log(`report exports as ${reportFileName(PROJECTS[0], day)}`);
 }
 
-// ── no real company is named anywhere ──────────────────────────────────────
-// The forest data is real; every company on screen is invented. A name that is
-// one letter from a real firm is a worse problem than a joke name, so this list
-// covers the obvious ones and the file stays reviewable by eye.
+// ── internal illustrative fixtures never borrow real-company names ─────────
+// These actors support Forest Explorer fixtures and are not part of the public
+// Companies experience. They still must not borrow real-company names.
 const REAL_FIRMS = [
   "verra", "gold standard", "south pole", "kariba", "sgs", "tuv", "tüv", "der norske",
   "dnv", "bureau veritas", "aenor", "ruby canyon", "environmental services inc",
@@ -192,14 +244,18 @@ const REAL_FIRMS = [
 ];
 const actorText = JSON.stringify(ACTORS).toLowerCase();
 for (const firm of REAL_FIRMS)
-  assert(!actorText.includes(firm), `actors.js names a real firm ("${firm}") — every company here must be invented`);
+  assert(!actorText.includes(firm), `actors.js internal fixtures name a real firm ("${firm}")`);
 assert(ACTORS.every((a) => a.name && a.role && a.country), "an actor is missing a name, role or country");
 assert(new Set(ACTORS.map((a) => a.id)).size === ACTORS.length, "duplicate actor id");
 for (const role of ["developer", "verifier", "registry", "buyer"])
   assert(ACTORS.some((a) => a.role === role), `no actor fills the ${role} role`);
 
-// A verifier's record has to be computable, since the panel shows it.
-for (const vid of new Set(Object.values(PARTIES).map((x) => x.verifier))) {
+// A verifier's record has to be computable, since the panel shows it. Scoped
+// to verifiers that actually appear on an Amazon project — PARTIES is a
+// single global table shared with Zimbabwe's projects (see
+// projects-kariba.js), and this block's callback only knows how to look a
+// project up in the Amazon's own PROJECTS/CELLS.
+for (const vid of new Set(PROJECTS.map((p) => PARTIES[p.id]?.verifier).filter(Boolean))) {
   const rec = verifierRecord(vid, (pid) => {
     const proj = PROJECTS.find((x) => x.id === pid);
     const host = CELLS.find((c) => c.id === proj.hostCellId);
@@ -209,9 +265,157 @@ for (const vid of new Set(Object.values(PARTIES).map((x) => x.verifier))) {
   assert(Number.isFinite(rec.meanDiscrepancyPts), `${vid}: mean discrepancy is not a number`);
 }
 console.log(`
-${ACTORS.length} parties, all invented · ledgers reconcile to the credit record`);
+${ACTORS.length} internal illustrative parties · fixture ledgers reconcile to the credit record`);
 
-// ── the index must be able to say different things ─────────────────────────
+// ── internal illustrative portfolio fixtures still reconcile ───────────────
+// These aggregates remain development coverage for the Explorer; they are not
+// rendered in the real-only Companies interface.
+const companyProblems = validateCompanyData();
+assert(companyProblems.length === 0, `company index:\n  - ${companyProblems.join("\n  - ")}`);
+assert(
+  BUYER_LEADERBOARD.length === ACTORS.filter((a) => a.role === "buyer").length,
+  "a buyer is missing from the leaderboard"
+);
+assert(
+  DEVELOPER_LEADERBOARD.length === ACTORS.filter((a) => a.role === "developer").length,
+  "a developer is missing from the leaderboard"
+);
+for (const board of [BUYER_LEADERBOARD, DEVELOPER_LEADERBOARD]) {
+  assert(board.every((row, i) => row.rank === i + 1), "leaderboard ranks are not sequential");
+  assert(
+    board.every((row, i) => i === 0 || board[i - 1].score >= row.score),
+    "leaderboard is not sorted by score"
+  );
+}
+assert(
+  PUBLIC_COMPANIES.every((company) => company.relationshipSourceIds.length > 0),
+  "a real-company relationship is unsourced"
+);
+console.log(
+  `${BUYER_LEADERBOARD.length} internal buyer fixtures · ` +
+  `${DEVELOPER_LEADERBOARD.length} internal developer fixtures · ` +
+  `${PUBLIC_COMPANIES.length} sourced Kariba company records`
+);
+
+// ── the public carbon network is normalized, sourced and real-only ──────────
+const networkProblems = validateCarbonNetwork();
+assert(networkProblems.length === 0, `carbon network:\n  - ${networkProblems.join("\n  - ")}`);
+
+assert(REAL_COMPANIES.length === 16, "real network must contain exactly 16 sourced companies");
+assert(CREDIT_EXPOSURES.length === 16, "real network must contain exactly 16 sourced exposures");
+assert(REAL_PROJECTS.length === 1, "real network must contain only the sourced Kariba project");
+assert(REAL_PROJECTS[0].real === true, "Kariba project is not explicitly marked real");
+assert(REAL_PROJECTS[0].legacyId === "KARIBA-902", "the real network project is not Kariba VCS 902");
+assert(
+  !REAL_PROJECTS.some((project) => /illustrative/i.test(`${project.id} ${project.legacyId} ${project.name}`)),
+  "an illustrative project leaked into the real network"
+);
+assert(CARBON_NETWORK.mode === "real-only", "carbon network is not explicitly real-only");
+
+const realProject = REAL_PROJECTS[0];
+assert(realProject.creditsIssued === 26822953, "Kariba issued-credit total changed");
+assert(realProject.excessCreditsProjectWide === 15220520, "Kariba project-wide excess total changed");
+assert(realProject.dataQuality.datedCredits === 25706781, "Kariba dated-credit total changed");
+assert(realProject.dataQuality.datedRetirementRows === 6967, "Kariba dated-row total changed");
+assert(realProject.dataQuality.namedBeneficiaryCredits === 12674312, "Kariba informative-beneficiary total changed");
+assert(realProject.dataQuality.usableNamedRows === 982, "Kariba informative-beneficiary row total changed");
+assert(realProject.informativeBeneficiaryCoveragePct === 49.30338,
+  "Kariba informative-beneficiary coverage changed");
+assert(realProject.noCompanyExcessAllocation === true, "company-level excess allocation caveat was removed");
+
+const realCompanyIds = new Set(REAL_COMPANIES.map((company) => company.id));
+const realProjectIds = new Set(REAL_PROJECTS.map((project) => project.id));
+const realActorIds = new Set(REAL_PROJECT_ACTORS.map((actor) => actor.id));
+assert(realCompanyIds.size === REAL_COMPANIES.length, "real network has duplicate company IDs");
+assert(realProjectIds.size === REAL_PROJECTS.length, "real network has duplicate project IDs");
+assert(realActorIds.size === REAL_PROJECT_ACTORS.length, "real network has duplicate actor IDs");
+
+const exposurePairs = new Set();
+for (const exposure of CREDIT_EXPOSURES) {
+  assert(realCompanyIds.has(exposure.companyId), `${exposure.id}: company reference is invalid`);
+  assert(realProjectIds.has(exposure.projectId), `${exposure.id}: project reference is invalid`);
+  const pair = `${exposure.companyId}|${exposure.projectId}`;
+  assert(!exposurePairs.has(pair), `${exposure.id}: duplicate company-project relationship`);
+  exposurePairs.add(pair);
+  assert(Object.hasOwn(exposure, "quantityKnown"), `${exposure.id}: quantity-known flag is missing`);
+  assert(Object.hasOwn(exposure, "quantityExact"), `${exposure.id}: quantity-exact flag is missing`);
+  assert(exposure.quantityKnown === true, `${exposure.id}: documented quantity is not marked known`);
+  assert(exposure.quantityExact === true, `${exposure.id}: documented quantity is not marked exact`);
+  assert(
+    Number.isInteger(exposure.knownCredits) && exposure.knownCredits > 0,
+    `${exposure.id}: known credits must be a positive integer`
+  );
+  assert(exposure.sourceIds.length > 0, `${exposure.id}: exposure is unsourced`);
+  assert(
+    exposure.sources.length === exposure.sourceIds.length,
+    `${exposure.id}: source IDs and source objects do not reconcile`
+  );
+  for (const [index, sourceId] of exposure.sourceIds.entries()) {
+    assert(exposure.sources[index]?.id === sourceId, `${exposure.id}: source ${sourceId} is unresolved`);
+    assert(exposure.sources[index]?.url, `${exposure.id}: source ${sourceId} has no evidence link`);
+  }
+}
+
+for (const relationship of PROJECT_ACTOR_RELATIONSHIPS) {
+  assert(realActorIds.has(relationship.actorId), `${relationship.id}: actor reference is invalid`);
+  assert(realProjectIds.has(relationship.projectId), `${relationship.id}: project reference is invalid`);
+  assert(relationship.sourceIds.length > 0, `${relationship.id}: actor-project relationship is unsourced`);
+  assert(
+    relationship.sources.length === relationship.sourceIds.length,
+    `${relationship.id}: actor-project sources do not reconcile`
+  );
+}
+
+const tracedCredits = CREDIT_EXPOSURES.reduce((total, exposure) => total + exposure.knownCredits, 0);
+assert(tracedCredits === 11204911, "Kariba traced-credit total changed");
+assert(realProject.tracedCredits === tracedCredits, "project total does not reconcile to exposure edges");
+assert(realProject.exposureCount === CREDIT_EXPOSURES.length, "project exposure count does not reconcile");
+
+// Every invented actor name is banned from the real graph, including internal
+// developer, verifier and registry fixtures as well as the buyer fixtures.
+const illustrativeNames = ACTORS.map((actor) => actor.name.toLowerCase());
+const publicNetworkText = JSON.stringify({
+  companies: REAL_COMPANIES,
+  projects: REAL_PROJECTS,
+  actors: REAL_PROJECT_ACTORS,
+  exposures: CREDIT_EXPOSURES,
+}).toLowerCase();
+for (const name of illustrativeNames)
+  assert(!publicNetworkText.includes(name), `illustrative entity leaked into real network: ${name}`);
+
+const forbiddenCompanyFields = ["score", "rank", "exposureRank"];
+const companyAllocationPattern = /supported|unsupported|excess/i;
+for (const company of REAL_COMPANIES) {
+  assert(company.real === true, `${company.id}: company is not explicitly real`);
+  for (const field of forbiddenCompanyFields)
+    assert(!Object.hasOwn(company, field), `${company.id}: forbidden ${field} field appears in real company data`);
+  assert(
+    !Object.keys(company).some((field) => companyAllocationPattern.test(field)),
+    `${company.id}: project outcome was allocated to a company record`
+  );
+}
+for (const exposure of CREDIT_EXPOSURES) {
+  for (const field of forbiddenCompanyFields)
+    assert(!Object.hasOwn(exposure, field), `${exposure.id}: forbidden ${field} field appears on exposure`);
+  assert(
+    !Object.keys(exposure).some((field) => companyAllocationPattern.test(field)),
+    `${exposure.id}: project outcome was allocated to a company exposure`
+  );
+}
+
+assert(CARBON_NETWORK.companies === REAL_COMPANIES, "network company collection is not canonical");
+assert(CARBON_NETWORK.projects === REAL_PROJECTS, "network project collection is not canonical");
+assert(CARBON_NETWORK.actors === REAL_PROJECT_ACTORS, "network actor collection is not canonical");
+assert(CARBON_NETWORK.exposures === CREDIT_EXPOSURES, "network exposure collection is not canonical");
+assert(
+  CARBON_NETWORK.projectActorRelationships === PROJECT_ACTOR_RELATIONSHIPS,
+  "network actor-project collection is not canonical"
+);
+console.log(
+  `${REAL_COMPANIES.length} real Kariba companies · ${tracedCredits.toLocaleString("en-US")} traced credits · ` +
+  `${realProject.informativeBeneficiaryCoveragePct}% informative beneficiary coverage`
+);
+
 assert(bandsHit.size >= 3, `risk bands collapse: only ${[...bandsHit].join(", ")}`);
 assert(
   PROJECTS.some((p) => {
@@ -228,14 +432,15 @@ const src = (await import("node:fs")).readFileSync(new URL("./baseline.js", impo
 const covBlock = src.slice(src.indexOf("export const COVARIATES"), src.indexOf("export function covariateStats"));
 assert(!/WINDOW\[/.test(covBlock), "a covariate reads the outcome window — matching would be circular");
 
-// ── nothing claims anything about a real party ─────────────────────────────
+// ── internal illustrative project fixtures make no real-party claims ───────
 const REAL_ENTITIES = ["verra", "kariba", "south pole", "volkswagen", "nestl", "gucci", "vcs-", "gold standard"];
 const projectText = JSON.stringify(PROJECTS).toLowerCase();
 for (const e of REAL_ENTITIES)
   assert(!projectText.includes(e), `projects.js names a real entity ("${e}") — that belongs in a sourced case study`);
 
+const allKnownProjectIds = [...PROJECTS, ...KARIBA_PROJECTS].map((p) => p.id);
 for (const cs of CASE_STUDIES) {
-  const problems = validateCaseStudy(cs, PROJECTS.map((p) => p.id));
+  const problems = validateCaseStudy(cs, allKnownProjectIds);
   assert(problems.length === 0, `case study ${cs.projectId}:\n  - ${problems.join("\n  - ")}`);
 }
 console.log(`\n${CASE_STUDIES.length} case studies, all validated`);

@@ -11,38 +11,37 @@
 // matching criteria live behind one collapsed row.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { CELLS } from "./cells.js";
-import { PROJECTS } from "./projects.js";
 import { caseStudyFor } from "./caseStudies.js";
 import {
   ACTORS, ROLE_LABEL, actorById, buildLedger, purchaseRows, noteForRole, partiesFor, verifierRecord,
 } from "./actors.js";
 import {
-  COVARIATES, WINDOW, REFERENCE_PERIOD, matchControls, counterfactual,
-  auditBaseline, divergenceTimeline, lossFraction,
+  COVARIATES, matchControls, counterfactual,
+  auditBaseline, divergenceTimeline, lossFraction, portfolioExposure,
 } from "./baseline.js";
 // Shared with the exported report, so a reader checking the PDF against this
 // screen is comparing the same roundings rather than two of them.
-import { pct, pts, compact, money, full } from "./format.js";
+import { pct, pts, compact, money, full, multiple } from "./format.js";
 
-/** Run the audit for a project. Pure and instant — the delay in the UI is
- *  theatre for the viewer's benefit, not computation. */
-export function auditFor(project) {
+/** Run the audit for a project against one region's control pool and window.
+ *  Pure and instant — the delay in the UI is theatre for the viewer's
+ *  benefit, not computation. */
+export function auditFor(project, cells, window) {
   // Match at parcel resolution — the controls are one-degree parcels, so the
   // target must be one too. Observed loss comes from the project's own footprint.
-  const host = CELLS.find((c) => c.id === project.hostCellId) ?? project.parcel;
-  const { matches, considered } = matchControls(host, CELLS);
-  const cf = counterfactual(matches);
+  const host = cells.find((c) => c.id === project.hostCellId) ?? project.parcel;
+  const { matches, considered } = matchControls(host, cells);
+  const cf = counterfactual(matches, window);
   const audit = auditBaseline(project, cf);
-  const timeline = divergenceTimeline(project, matches);
-  const observedInside = lossFraction(project.parcel, WINDOW[0], WINDOW[1]);
+  const timeline = divergenceTimeline(project, matches, window);
+  const observedInside = lossFraction(project.parcel, window[0], window[1]);
   return { host, matches, considered, cf, audit, timeline, observedInside };
 }
 
-/** The audit for any project, by id — used for a verifier's whole portfolio. */
-const auditById = (projectId) => {
-  const p = PROJECTS.find((x) => x.id === projectId);
-  return p ? auditFor(p).audit : null;
+/** The audit for any project in a region, by id — used for a verifier's whole portfolio. */
+const auditByIdFor = (projects, cells, window) => (projectId) => {
+  const p = projects.find((x) => x.id === projectId);
+  return p ? auditFor(p, cells, window).audit : null;
 };
 
 /* ── the verification sequence ───────────────────────────────────────────── */
@@ -62,8 +61,11 @@ function Verification({ result, phase, ticked }) {
 }
 
 /* ── results ─────────────────────────────────────────────────────────────── */
-function Results({ project, result, year, snapshotMap }) {
+function Results({ project, result, year, snapshotMap, region }) {
   const { audit, cf, timeline, observedInside } = result;
+  const { PROJECTS, CELLS, REGION } = region;
+  const window = REGION.window;
+  const referencePeriod = REGION.referencePeriod;
   const study = caseStudyFor(project.id);
   const parties = partiesFor(project.id);
   const [showMethod, setShowMethod] = useState(false);
@@ -71,95 +73,66 @@ function Results({ project, result, year, snapshotMap }) {
   // The verdict, in the units a buyer transacts in. This is the largest text in
   // the panel because it is the only sentence most readers will finish.
   const verdict = audit.creditsUnsupported > 0
-    ? `${compact(audit.creditsUnsupported)} of ${compact(audit.creditsIssued)} credits are not supported by satellite evidence.`
+    ? `The satellite record does not support ${compact(audit.creditsUnsupported)} of ${compact(audit.creditsIssued)} credits issued.`
     : `The claimed baseline is consistent with what comparable land actually did.`;
+  const overstatement = multiple(audit.overstatementMultiple);
 
   const ledger = useMemo(
     () => buildLedger(project, timeline.firstFlagYear),
     [project.id, timeline.firstFlagYear]
   );
+  const auditById = useMemo(() => auditByIdFor(PROJECTS, CELLS, window), [PROJECTS, CELLS, window]);
   const record = useMemo(
     () => (parties ? verifierRecord(parties.verifier, auditById) : null),
-    [project.id]
+    [project.id, auditById]
   );
 
-  // Year-by-year, truncated at the year the map is showing, so the panel and the
-  // map are never telling the viewer about different points in time.
-  const rows = timeline.rows.filter((r) => r.year <= year);
-  const scale = Math.max(...timeline.rows.map((r) => Math.max(r.claimed, r.observed))) * 1.1 || 1;
 
   return (
     <>
-      {/* 2 — the verdict */}
+      {/* 2 — the accusation, as a number */}
       <div className="sec">
-        <div className="verdict" style={{ color: audit.band.color }}>{verdict}</div>
+        <div className="headline-k">
+          {overstatement ? "Claim overstated by" : "What the record shows"}
+        </div>
+        {overstatement ? (
+          <div className="headline-v" style={{ color: audit.supportBand.color }}>{overstatement}</div>
+        ) : (
+          <div className="headline-none">No forest saved</div>
+        )}
+        <div className="verdict">{verdict}</div>
         <div className="verdict-sub">
-          Over {WINDOW[0]}–{WINDOW[1]}, measured against {cf.n} comparable unprotected parcels.
-        </div>
-      </div>
-
-      {/* 3 — the three figures the verdict rests on */}
-      <div className="sec">
-        <div className="figures">
-          <div className="figure">
-            <div className="figure-k">Project's baseline</div>
-            <div className="figure-v" style={{ color: "var(--loss)" }}>{pct(audit.claimed)}</div>
-          </div>
-          <div className="figure">
-            <div className="figure-k">Independent estimate</div>
-            <div className="figure-v" style={{ color: "var(--control-ink)" }}>{pct(audit.independent)}</div>
-          </div>
-          <div className="figure">
-            <div className="figure-k">Discrepancy</div>
-            <div className="figure-v" style={{ color: audit.band.color }}>{pts(audit.discrepancyPts)}</div>
-          </div>
-        </div>
-        <div className="notice" style={{ marginTop: 10 }}>
-          Predicted loss without the project, against what {cf.n} comparable parcels actually lost.
-          The project's own area lost {pct(observedInside)}.
-        </div>
-      </div>
-
-      {/* 4 — the evidence, year by year */}
-      <div className="sec">
-        <div className="sec-title">Claimed pace against comparable land</div>
-        {rows.map((r) => (
-          <div className="tl-row" key={r.year}>
-            <span className="tl-year">{r.year}</span>
-            <span className="tl-bars">
-              <i style={{ top: 1, width: `${(r.claimed / scale) * 100}%`, background: "var(--loss)", opacity: 0.8 }} />
-              <i style={{ top: 9, width: `${(r.observed / scale) * 100}%`, background: "var(--control-ink)" }} />
-            </span>
-          </div>
-        ))}
-        <div className="notice" style={{ marginTop: 8 }}>
-          <span style={{ color: "var(--loss)" }}>■</span> claimed ·{" "}
-          <span style={{ color: "var(--control-ink)" }}>■</span> comparable unprotected land
+          Over {window[0]}–{window[1]}, measured against {cf.n} comparable unprotected parcels.
+          Flagged for field verification.
         </div>
         {timeline.firstFlagYear && (
           <div className="flagbox">
-            Detectable from <b>{timeline.firstFlagYear}</b> — <b>{timeline.yearsOfWarning} years</b> before
+            Detectable from <b>{timeline.firstFlagYear}</b>, <b>{timeline.yearsOfWarning} years</b> before
             the window closed, while credits were still being issued and retired.
           </div>
         )}
       </div>
 
-      {/* 5 — the money */}
+      {/* 3 — the subtraction the headline rests on, aligned so it adds up by eye */}
       <div className="sec">
-        <div className="sec-title">Exposure</div>
-        <div className="stats">
-          <div className="stat">
-            <div className="stat-k">Not supported</div>
-            <div className="stat-v" style={{ color: audit.band.color }}>{compact(audit.creditsUnsupported)}</div>
+        <div className="sec-title">How the benefit was measured</div>
+        <div className="derivation">
+          <div className="drv-row">
+            <span className="drv-k">Comparable land lost</span>
+            <span className="drv-v" style={{ color: "var(--control-ink)" }}>{pct(audit.independent, 2)}</span>
           </div>
-          <div className="stat">
-            <div className="stat-k">At ${audit.pricePerCredit.toFixed(2)}</div>
-            <div className="stat-v" style={{ color: audit.band.color }}>{money(audit.valueUnsupported)}</div>
+          <div className="drv-row">
+            <span className="drv-k">Project&rsquo;s own ground lost</span>
+            <span className="drv-v" style={{ color: "var(--loss)" }}>−&thinsp;{pct(audit.observedInside, 2)}</span>
           </div>
-        </div>
-        <div className="notice" style={{ marginTop: 9 }}>
-          <b>{compact(audit.creditsRetired)}</b> of the {compact(audit.creditsIssued)} issued are already
-          retired against buyers' targets and cannot be reversed.
+          <div className="drv-row is-sum">
+            <span className="drv-k">Benefit the record supports</span>
+            <span className="drv-v">{pts(audit.realBenefit * 100)}</span>
+          </div>
+          <div className="drv-row is-claim">
+            <span className="drv-k">Claimed without the project</span>
+            <span className="drv-v">{pct(audit.claimed, 2)}</span>
+          </div>
         </div>
       </div>
 
@@ -167,7 +140,10 @@ function Results({ project, result, year, snapshotMap }) {
       {parties && <Parties project={project} parties={parties} record={record} ledger={ledger} audit={audit} />}
 
       {/* 7 — the report */}
-      <ExportReport project={project} result={result} year={year} record={record} snapshotMap={snapshotMap} />
+      <ExportReport
+        project={project} result={result} year={year} record={record} snapshotMap={snapshotMap}
+        window={window} referencePeriod={referencePeriod} sourceLabel={region.sourceLabel}
+      />
 
       {study && <CaseStudy study={study} />}
 
@@ -180,13 +156,13 @@ function Results({ project, result, year, snapshotMap }) {
         {showMethod && (
           <div className="notice" style={{ marginTop: 10 }}>
             The project's parcel is described by {COVARIATES.length} characteristics measured over{" "}
-            {REFERENCE_PERIOD[0]}–{REFERENCE_PERIOD[1]}, before the crediting window opened, so nothing
+            {referencePeriod[0]}–{referencePeriod[1]}, before the crediting window opened, so nothing
             about the outcome can leak into the comparison. Unprotected parcels resembling it are then
-            observed over {WINDOW[0]}–{WINDOW[1]}. {result.matches.length} matched from {result.considered}{" "}
+            observed over {window[0]}–{window[1]}. {result.matches.length} matched from {result.considered}{" "}
             candidates; parcels within 1.5° are excluded so displaced clearing cannot flatter the result.
             <br /><br />
-            Deforestation is INPE PRODES, the official Brazilian Amazon record. This is a screening
-            estimate from public data, not an audit and not a determination about any party.
+            Deforestation is {region.sourceLabel ?? "INPE PRODES, the official Brazilian Amazon record"}.
+            This is a screening estimate from public data, not an audit and not a determination about any party.
           </div>
         )}
       </div>
@@ -301,7 +277,7 @@ function Parties({ project, parties, record, ledger, audit }) {
  * looking at, including where they had put the camera and which year they had
  * scrubbed to.
  */
-function ExportReport({ project, result, year, record, snapshotMap }) {
+function ExportReport({ project, result, year, record, snapshotMap, window, referencePeriod, sourceLabel, lossLabel }) {
   const [state, setState] = useState({ phase: "idle" });
 
   async function download() {
@@ -316,6 +292,10 @@ function ExportReport({ project, result, year, record, snapshotMap }) {
         year,
         record,
         mapImage: snapshotMap?.() ?? null,
+        window,
+        referencePeriod,
+        sourceLabel,
+        lossLabel,
       });
       setState({ phase: "done", name });
     } catch (err) {
@@ -338,7 +318,7 @@ function ExportReport({ project, result, year, record, snapshotMap }) {
         ) : (
           <>
             The verdict, the three figures, the year-by-year evidence, the map as it is framed right
-            now, and who bought the credits — as one file to send on.
+            now, and who bought the credits, as one file to send on.
           </>
         )}
       </div>
@@ -368,9 +348,10 @@ function CaseStudy({ study }) {
 }
 
 /* ── the panel ───────────────────────────────────────────────────────────── */
-export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
+export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap, region }) {
+  const { PROJECTS, CELLS, REGION } = region;
   const project = PROJECTS.find((p) => p.id === id);
-  const result = useMemo(() => auditFor(project), [id]);
+  const result = useMemo(() => auditFor(project, CELLS, REGION.window), [id, CELLS, REGION.window]);
   const [phase, setPhase] = useState("idle");
   const [ticked, setTicked] = useState(0);
   const timers = useRef([]);
@@ -401,7 +382,6 @@ export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
     );
   }
 
-  const { audit } = result;
   return (
     <aside className="panel side">
       <div className="side-head">
@@ -411,8 +391,8 @@ export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
         <div className="p-name" style={{ marginTop: 9 }}>{project.name}</div>
         <div className="p-meta">{project.locality} · {project.country} · {compact(project.areaHa)} ha · start {project.startYear}</div>
         <div className="tags">
-          <span className="tag" style={{ borderColor: audit.band.color + "66", color: audit.band.color }}>
-            {audit.band.label} baseline risk
+          <span className="tag">
+            {project.real === true ? "Real registered project" : "Illustrative project"}
           </span>
         </div>
       </div>
@@ -420,9 +400,11 @@ export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
       <div className="side-body">
         {phase !== "done" && (
           <div className="sec">
-            <div className="stats">
+            <div className="stats" style={project.creditsRetired == null ? { gridTemplateColumns: "1fr" } : undefined}>
               <div className="stat"><div className="stat-k">Credits issued</div><div className="stat-v">{compact(project.creditsIssued)}</div></div>
-              <div className="stat"><div className="stat-k">Credits retired</div><div className="stat-v">{compact(project.creditsRetired)}</div></div>
+              {project.creditsRetired != null && (
+                <div className="stat"><div className="stat-k">Credits retired</div><div className="stat-v">{compact(project.creditsRetired)}</div></div>
+              )}
             </div>
             {phase === "idle" ? (
               <>
@@ -443,7 +425,7 @@ export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
 
         <Verification result={result} phase={phase} ticked={ticked} />
         {phase === "done" && (
-          <Results project={project} result={result} year={year} snapshotMap={snapshotMap} />
+          <Results project={project} result={result} year={year} snapshotMap={snapshotMap} region={region} />
         )}
       </div>
     </aside>
@@ -451,38 +433,67 @@ export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
 }
 
 /* ── list, shown when nothing is selected ────────────────────────────────── */
-export function ProjectList({ onSelect }) {
+export function ProjectList({ onSelect, region }) {
   useEffect(() => { document.title = "Phantom"; }, []);
+  const { PROJECTS, CELLS, REGION } = region;
+
+  // Every project in the region audited on the same terms, rolled into one
+  // total. Computed here rather than stored, so the total can never drift from
+  // the per-project figures a reader gets by opening the rows underneath it.
+  const rows = useMemo(() => PROJECTS
+    .map((p) => ({ p, audit: auditFor(p, CELLS, REGION.window).audit }))
+    .sort((a, b) => b.audit.valueUnsupported - a.audit.valueUnsupported),
+    [PROJECTS, CELLS, REGION.window]);
+  const portfolio = useMemo(() => portfolioExposure(rows.map((r) => r.audit)), [rows]);
+
   return (
     <aside className="panel side">
       <div className="side-head">
-        <div className="sec-title" style={{ marginBottom: 6 }}>Registered forest carbon projects</div>
-        <div className="notice">
-          Every credit rests on a prediction of what would have happened without the project — written
-          by the project itself. Pick one and Phantom rebuilds that prediction from public satellite
-          records and comparable unprotected forest.
+        <div className="sec-title" style={{ marginBottom: 6 }}>Forest carbon projects</div>
+        <div className="portfolio">
+          <div className="portfolio-k">Unsupported across {portfolio.projects} projects</div>
+          <div className="portfolio-v">{money(portfolio.valueUnsupported)}</div>
+          <div className="portfolio-sub">
+            {compact(portfolio.creditsUnsupported)} of {compact(portfolio.creditsIssued)} credits issued.{" "}
+            {portfolio.withoutMeasurableBenefit > 0 && (
+              <>{portfolio.withoutMeasurableBenefit} of them saved no forest compared with
+              similar land. </>
+            )}
+            {portfolio.worstMultiple != null && <>Widest single overstatement {multiple(portfolio.worstMultiple)}.</>}
+          </div>
         </div>
       </div>
       <div className="side-body">
-        {[...PROJECTS]
-          .sort((a, b) => b.claimedBaselineLoss - a.claimedBaselineLoss)
-          .map((p) => (
-            <button key={p.id} className="sec" style={{ display: "block", width: "100%", textAlign: "left" }} onClick={() => onSelect(p.id)}>
+        {rows.map(({ p, audit }) => (
+          <button key={p.id} className="sec list-row" onClick={() => onSelect(p.id)}>
+            <div className="list-row-main">
               <div className="p-name" style={{ fontSize: 14.5 }}>{p.name}</div>
               <div className="p-meta" style={{ fontSize: 11.5 }}>
-                {p.locality} · {compact(p.creditsIssued)} credits · claims {pct(p.claimedBaselineLoss, 0)} loss
+                {p.real === true ? "Real registered project" : "Illustrative project"} · {p.locality} ·{" "}
+                {compact(p.creditsIssued)} credits · claims {pct(p.claimedBaselineLoss, 0)} loss
               </div>
-            </button>
-          ))}
+            </div>
+            <div className="list-row-fig">
+              <span
+                className={`list-row-mult${audit.overstatementMultiple == null ? " is-text" : ""}`}
+                style={{ color: audit.supportBand.color }}
+              >
+                {multiple(audit.overstatementMultiple) ?? "no forest saved"}
+              </span>
+              <span className="list-row-val">{money(audit.valueUnsupported)}</span>
+            </div>
+          </button>
+        ))}
       </div>
     </aside>
   );
 }
 
 /* ── settings, hidden behind the gear ────────────────────────────────────── */
-export function Settings({ open, layers, setLayers, onClose }) {
+export function Settings({ open, layers, setLayers, onClose, region }) {
   if (!open) return null;
   const set = (k) => (v) => setLayers((l) => ({ ...l, [k]: v }));
+  const { REGION } = region;
   const Toggle = ({ k, label, note }) => (
     <div className="row">
       <div>
@@ -500,16 +511,27 @@ export function Settings({ open, layers, setLayers, onClose }) {
         <Toggle k="controls" label="Comparable parcels" note="shown after a verification runs" />
       </div>
       <div className="sec">
-        <div className="sec-title">Data</div>
+        <div className="sec-title">Data: {region.sublabel}</div>
         <div className="notice">
-          Deforestation: <a href="https://terrabrasilis.dpi.inpe.br" target="_blank" rel="noreferrer">INPE PRODES</a>,
-          the official Brazilian Amazon record — annual clear-cut increments, {REFERENCE_PERIOD[0]}–{WINDOW[1]}.
+          Deforestation:{" "}
+          {region.key === "kariba" ? (
+            <><a href="https://globalnaturewatch.org" target="_blank" rel="noreferrer">Global Nature Watch</a> (formerly
+            Global Forest Watch), Hansen Global Forest Change: annual tree-cover loss, {REGION.referencePeriod[0]}–{REGION.window[1]}.</>
+          ) : (
+            <><a href="https://terrabrasilis.dpi.inpe.br" target="_blank" rel="noreferrer">INPE PRODES</a>,
+            the official Brazilian Amazon record: annual clear-cut increments, {REGION.referencePeriod[0]}–{REGION.window[1]}.</>
+          )}{" "}
           Terrain and rainfall: <a href="https://open-meteo.com" target="_blank" rel="noreferrer">Open-Meteo</a>.
           Imagery: <a href="https://s2maps.eu" target="_blank" rel="noreferrer">Sentinel-2 cloudless by EOX</a>.
           Place names © CARTO, OpenStreetMap.
           <br /><br />
-          Project records, company names and credit volumes in this build are illustrative and describe
-          no real party. The deforestation measured under and around them is real.
+          {region.key === "kariba" ? (
+            "Kariba REDD+ is a real, registered project. See the case study below for sourced facts " +
+            "about its registry status and Verra's findings. Its boundary is an approximation; see the case study."
+          ) : (
+            "Project records, company names and credit volumes in this build are illustrative and describe " +
+            "no real party. The deforestation measured under and around them is real."
+          )}
         </div>
       </div>
       <div className="sec">
