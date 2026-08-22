@@ -84,7 +84,7 @@ export const COVARIATES = [
     label: "Elevation",
     unit: "m",
     format: (v) => Math.round(v) + " m",
-    get: (c) => c.elevationM ?? 0,
+    get: (c) => c.elevationM ?? null,
     why: "Terrain shapes both agricultural suitability and how reachable a parcel is.",
   },
   {
@@ -92,7 +92,7 @@ export const COVARIATES = [
     label: "Terrain ruggedness",
     unit: "m",
     format: (v) => Math.round(v) + " m",
-    get: (c) => c.ruggednessM ?? 0,
+    get: (c) => c.ruggednessM ?? null,
     why: "Elevation spread within the parcel. Broken ground resists mechanised clearing.",
   },
   {
@@ -100,7 +100,7 @@ export const COVARIATES = [
     label: "Rainfall",
     unit: "mm/yr",
     format: (v) => Math.round(v) + " mm",
-    get: (c) => c.precipMmYr ?? 0,
+    get: (c) => c.precipMmYr ?? null,
     why: "Separates wet closed-canopy forest from drier transitional forest, which clear under different economics.",
   },
   {
@@ -128,15 +128,28 @@ export function covariateStats(pool) {
 /**
  * Standardised distance between two parcels: a diagonal Mahalanobis distance,
  * scaled per covariate so no single unit dominates. Lower is more alike.
+ *
+ * Covariates missing on either side are skipped rather than treated as zero —
+ * an absent elevation is not sea level, and scoring it as such would quietly
+ * distort every comparison that touched it.
  */
 export function distance(a, b, stats) {
   let sum = 0;
+  let used = 0;
   for (const cv of COVARIATES) {
-    const d = (cv.get(a) - cv.get(b)) / stats[cv.key].sd;
+    const va = cv.get(a);
+    const vb = cv.get(b);
+    if (!Number.isFinite(va) || !Number.isFinite(vb)) continue;
+    const d = (va - vb) / stats[cv.key].sd;
     sum += d * d;
+    used++;
   }
-  return Math.sqrt(sum / COVARIATES.length);
+  return used ? Math.sqrt(sum / used) : Infinity;
 }
+
+/** Which covariates actually have data across the pool. */
+export const availableCovariates = (pool) =>
+  COVARIATES.filter((cv) => pool.some((c) => Number.isFinite(cv.get(c))));
 
 /** 0-100 readability score for a distance. 1.0 sd of average mismatch ≈ 61%. */
 export const similarity = (d) => 100 * Math.exp(-d / 2);
@@ -213,11 +226,17 @@ export function percentileOf(value, sortedLosses) {
   return (below / sortedLosses.length) * 100;
 }
 
+/**
+ * Bands over the percentile, with thresholds set for the sample sizes this
+ * actually runs on. With 15 controls the highest percentile any claim can reach
+ * is 14/15 — so a 99-point threshold would be unreachable by construction and
+ * the top band would never fire no matter how extreme the baseline.
+ */
 export const RISK_BANDS = [
-  { key: "severe", label: "Severe", min: 99, color: "#e5484d" },
-  { key: "high", label: "High", min: 95, color: "#ee7f2d" },
-  { key: "elevated", label: "Elevated", min: 85, color: "#e8b931" },
-  { key: "moderate", label: "Moderate", min: 60, color: "#9bcf3b" },
+  { key: "severe", label: "Severe", min: 95, color: "#e5484d" },
+  { key: "high", label: "High", min: 88, color: "#ee7f2d" },
+  { key: "elevated", label: "Elevated", min: 75, color: "#e8b931" },
+  { key: "moderate", label: "Moderate", min: 55, color: "#9bcf3b" },
   { key: "consistent", label: "Consistent", min: 0, color: "#2fbf71" },
 ];
 export const riskBandFor = (percentile) => RISK_BANDS.find((b) => percentile >= b.min);
@@ -234,12 +253,35 @@ export function auditBaseline(project, cf) {
   const independent = cf.median;
   const percentile = percentileOf(claimed, cf.losses);
   const band = riskBandFor(percentile);
-  const inflationPts = (claimed - independent) * 100;
+
+  // ── the one chain every displayed figure hangs off ──────────────────────
+  //
+  // These four lines are the whole comparison, and they are written out in
+  // sequence so the arithmetic is checkable by eye:
+  //
+  //   discrepancy      = claimed − independent
+  //   unsupportedShare = discrepancy ÷ claimed
+  //   creditsUnsupported = issued × unsupportedShare
+  //
+  // Everything the interface renders derives from here. An earlier build showed
+  // a 16-point discrepancy beside an "avoided deforestation" panel reading
+  // 0.0% against 0.0%, because those two framings were computed independently
+  // and happened to disagree: this project lost more forest than its own
+  // baseline predicted, so its *avoided* figure is zero while its *baseline*
+  // still sits far above what comparable land did. Both were true and together
+  // they read as a bug. The panel now states the baseline comparison only, and
+  // `selfcheck.mjs` asserts the chain holds for every project.
+  const discrepancyPts = (claimed - independent) * 100;
+  const supportedShare = claimed > 0 ? Math.min(1, independent / claimed) : 1;
+  const unsupportedShare = 1 - supportedShare;
+  const creditsUnsupported = Math.round(project.creditsIssued * unsupportedShare);
   const ratio = independent > 0 ? claimed / independent : Infinity;
 
-  // Share of issued credits the independent baseline does not support.
-  const supportedShare = claimed > 0 ? Math.min(1, independent / claimed) : 1;
-  const creditsUnsupported = Math.round(project.creditsIssued * (1 - supportedShare));
+  // A buyer wants one number. This is the percentile inverted: 100 means the
+  // baseline sits at the bottom of what comparable land actually did, 0 means
+  // it sits above essentially all of it. It is a summary of the comparison,
+  // not a rating of the project.
+  const consistencyScore = Math.round(100 - percentile);
 
   return {
     claimed,
@@ -248,11 +290,16 @@ export function auditBaseline(project, cf) {
     p75: cf.p75,
     controls: cf.n,
     percentile,
+    consistencyScore,
     band,
-    inflationPts,
+    discrepancyPts,
     ratio,
     supportedShare,
+    unsupportedShare,
     creditsUnsupported,
+    creditsIssued: project.creditsIssued,
+    creditsRetired: project.creditsRetired,
+    pricePerCredit: project.pricePerCredit ?? 5.69,
     valueUnsupported: creditsUnsupported * (project.pricePerCredit ?? 5.69),
   };
 }

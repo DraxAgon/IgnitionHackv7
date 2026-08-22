@@ -8,9 +8,12 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "node src/selfcheck.mjs",
-    "measure": "node tools/measure.mjs"
+    "collect": "node tools/collect.mjs",
+    "projects": "node tools/make-projects.mjs"
   },
   "dependencies": {
+    "@turf/turf": "^7.4.0",
+    "jspdf": "^4.2.1",
     "maplibre-gl": "^6.5.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

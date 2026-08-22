@@ -1,134 +1,154 @@
-import { useEffect, useState } from "react";
-import MapView from "./MapView.jsx";
-import { Controls, ProjectList, Detail, Buyers, Legend } from "./Panels.jsx";
-import { buildChangeMosaic } from "./changeCanvas.js";
-import { projectById, TOTALS, MEASUREMENT_META } from "./verdicts.js";
-import { REGION } from "./data.js";
-import { fmtCompact, fmtInt, useCountUp } from "./ui.jsx";
+import { useCallback, useEffect, useRef, useState } from "react";
+import MapView, { YEARS, imageryYearFor, UNIFORM_REFERENCE_SHAPES } from "./MapView.jsx";
+import YearSlider from "./YearSlider.jsx";
+import { ProjectPanel, ProjectList, Settings } from "./Panels.jsx";
+import { WINDOW } from "./baseline.js";
 
-const DEFAULT_LAYERS = { loss: true, canopy: false, projects: true, rings: true, pins: true, change: true };
+/** Respect a viewer who has asked for less movement: no auto-play for them. */
+const prefersReducedMotion = () =>
+  typeof window !== "undefined" &&
+  window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 export default function App() {
-  const [mode, setMode] = useState("index");
   const [selectedId, setSelectedId] = useState(null);
-  const [layers, setLayers] = useState(DEFAULT_LAYERS);
-  const [year, setYear] = useState(MEASUREMENT_META.endYear);
-  const [filters, setFilters] = useState({ grades: [], q: "" });
-  const [sort, setSort] = useState("unsupported");
-  const [mosaic, setMosaic] = useState(null);
-  const [status, setStatus] = useState({ basemap: null, ready: false });
-  const [loadingScene, setLoadingScene] = useState(false);
+  const [year, setYear] = useState(WINDOW[1]);
+  const [playing, setPlaying] = useState(false);
+  const [matches, setMatches] = useState(null);
+  const [settings, setSettings] = useState(false);
+  const [layers, setLayers] = useState({ labels: true, controls: true });
+  const [lossData, setLossData] = useState(null);
+  const [parcelShapes, setParcelShapes] = useState(null);
+  // The map hands back a way to photograph itself once it has loaded. The
+  // report needs the map as the viewer has it framed, and only the map knows
+  // how to read its own canvas back.
+  const mapApi = useRef(null);
+  const snapshotMap = useCallback(() => mapApi.current?.snapshot() ?? null, []);
 
-  // Build the decoded forest-change overlay for whichever project is selected.
+  // The forest outlines of the comparable parcels, baked once from PRODES.
+  // Only used when MapView is drawing measured outlines rather than the one
+  // shape language; if the file is absent the map draws the synthetic outline,
+  // which is inscribed in the box the measurement is taken over anyway.
   useEffect(() => {
-    let dead = false;
-    let built = null;
-    setMosaic(null);
-    if (!selectedId) return;
-    setLoadingScene(true);
-    setYear(MEASUREMENT_META.endYear);
-    buildChangeMosaic(projectById[selectedId], { zoom: MEASUREMENT_META.zoom })
-      .then((m) => {
-        built = m;
-        if (dead) return m.destroy();
-        setMosaic(m);
-      })
-      .catch(() => {})
-      .finally(() => !dead && setLoadingScene(false));
-    return () => {
-      dead = true;
-      built?.destroy();
-    };
+    // Only fetched when the map is actually going to draw them: the file is
+    // several megabytes, and by default every zone is drawn synthetically.
+    if (UNIFORM_REFERENCE_SHAPES) return;
+    let live = true;
+    fetch(`${import.meta.env.BASE_URL}mapdata/parcels.json`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((doc) => live && setParcelShapes(doc?.parcels ?? null))
+      .catch(() => {});
+    return () => { live = false; };
+  }, []);
+
+  // Clearing polygons are large and only ever needed for the open project, so
+  // they load on selection rather than up front.
+  useEffect(() => {
+    if (!selectedId) { setLossData(null); return; }
+    let live = true;
+    setLossData(null);
+    fetch(`${import.meta.env.BASE_URL}mapdata/loss-${selectedId}.json`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((doc) => live && setLossData(doc))
+      .catch(() => {});
+    return () => { live = false; };
+  }, [selectedId]);
+
+  // Opening a project rewinds to the start of the window: the story is the
+  // sequence, and dropping a viewer at the end of it gives away the ending.
+  useEffect(() => {
+    setPlaying(false);
+    if (selectedId) setYear(WINDOW[0]);
+    else setYear(WINDOW[1]);
   }, [selectedId]);
 
   useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && setSelectedId(null);
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      if (settings) setSettings(false);
+      else setSelectedId(null);
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, [settings]);
+
+  const togglePlay = useCallback(() => {
+    if (prefersReducedMotion()) return;
+    setPlaying((p) => !p);
   }, []);
 
-  const select = (id) => {
-    setSelectedId(id);
-    if (id) setMode("index");
-  };
+  const changeYear = useCallback((next) => {
+    setYear((prev) => (typeof next === "function" ? next(prev) : next));
+  }, []);
 
-  const dollars = useCountUp(TOTALS.dollarsUnsupported, 1400);
+  const imageryYear = imageryYearFor(year);
 
   return (
     <div className="app">
       <MapView
-        layers={layers}
-        selectedId={selectedId}
-        onSelect={select}
-        mosaic={mosaic}
         year={year}
-        onStatus={setStatus}
+        selectedId={selectedId}
+        onSelect={setSelectedId}
+        controls={matches}
+        showControls={layers.controls}
+        showLabels={layers.labels}
+        parcelShapes={parcelShapes}
+        lossData={lossData}
+        onReady={(api) => { mapApi.current = api; }}
       />
 
-      <div className="overlay">
-        <header className="topbar">
-          <div className="brand">
-            <span className="brand-mark">PHANTOM</span>
-            <span className="brand-region">{REGION.name} · {REGION.sub}</span>
-          </div>
-
-          <div className="seg" role="tablist" aria-label="View">
-            {[["index", "Index"], ["buyers", "Buyers"]].map(([k, label]) => (
-              <button
-                key={k} role="tab" className="seg-btn" aria-selected={mode === k}
-                onClick={() => { setMode(k); if (k === "buyers") setSelectedId(null); }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          <div className="chip" title="Total credit value not supported by satellite evidence">
-            <span className="num" style={{ color: "var(--danger)", fontSize: 14, fontWeight: 700 }}>
-              {fmtCompact(dollars)}
-            </span>
-            unsupported across {TOTALS.projects} projects
-          </div>
-
-          <div className="spacer" />
-
-          <div className="chip" title={MEASUREMENT_META.citation}>
-            <i className={`dot ${status.basemap === false ? "dot-warn" : status.ready ? "dot-live" : "dot-off"}`} />
-            {status.basemap === false ? "offline — basemap unavailable" : `real satellite data · ${fmtInt(TOTALS.pixels)} px measured`}
-          </div>
-        </header>
-
-        <Controls
-          layers={layers} setLayers={setLayers}
-          year={year} setYear={setYear}
-          filters={filters} setFilters={setFilters}
-          selectedId={selectedId}
-        />
-
-        {mode === "buyers" ? (
-          <Buyers onSelect={select} />
-        ) : selectedId ? (
-          <Detail id={selectedId} onBack={() => setSelectedId(null)} year={year} />
-        ) : (
-          <ProjectList onSelect={select} filters={filters} setFilters={setFilters} sort={sort} setSort={setSort} />
-        )}
-
-        <footer className="bottombar">
-          <Legend selectedId={selectedId} />
-          <div className="attrib">
-            Forest data: UMD/Hansen GFC v1.11 via <a href="https://www.globalforestwatch.org" target="_blank" rel="noreferrer">Global Forest Watch</a>
-            {" · "}Basemap © <a href="https://carto.com/" target="_blank" rel="noreferrer">CARTO</a>, OpenStreetMap
-            <br />
-            Projects, registry IDs and companies are <strong>fictional</strong>. Forest measurements are real.
-          </div>
-        </footer>
-      </div>
-
-      {loadingScene && (
-        <div className="scene-loading">
-          <i className="spin" /> decoding satellite tiles
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-mark">PHANTOM</span>
+          <span className="brand-sub">independent baseline verification</span>
         </div>
+        <div className="spacer" />
+        <button
+          className="icon-btn"
+          aria-expanded={settings}
+          aria-label="Settings and data sources"
+          onClick={() => setSettings((s) => !s)}
+        >
+          ⚙
+        </button>
+      </header>
+
+      <Settings open={settings} layers={layers} setLayers={setLayers} onClose={() => setSettings(false)} />
+
+      {selectedId ? (
+        <ProjectPanel
+          id={selectedId}
+          year={year}
+          onClose={() => setSelectedId(null)}
+          onVerified={setMatches}
+          snapshotMap={snapshotMap}
+        />
+      ) : (
+        <ProjectList onSelect={setSelectedId} />
       )}
+
+      {selectedId && (
+        <>
+          <YearSlider
+            year={year}
+            years={YEARS}
+            onChange={changeYear}
+            playing={playing}
+            onPlayToggle={togglePlay}
+            imageryNote={`Sentinel-2 ${imageryYear}`}
+          />
+          <div className="legend panel">
+            <span><i style={{ background: "#F0B429" }} />project boundary</span>
+            <span><i style={{ background: "#5B8A9A" }} />comparable parcels</span>
+            <span><i style={{ background: "#FF4D3D" }} />forest cleared by {year}</span>
+          </div>
+        </>
+      )}
+
+      <footer className="footnote">
+        Illustrative project records · real forest data ·{" "}
+        <a href="https://terrabrasilis.dpi.inpe.br" target="_blank" rel="noreferrer">INPE PRODES</a>,{" "}
+        <a href="https://s2maps.eu" target="_blank" rel="noreferrer">Sentinel-2 cloudless by EOX</a>
+      </footer>
     </div>
   );
 }

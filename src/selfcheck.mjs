@@ -1,98 +1,248 @@
 // node src/selfcheck.mjs
-// Runs the real pipeline over the bundled satellite measurements and asserts
-// the index's invariants. No browser, no network.
+// Asserts the dataset and the analysis hold together. No browser, no network.
 import assert from "node:assert";
-import { analyzeCovers, analyzeHoldings, PRICE_PER_CREDIT } from "./engine.js";
-import { coversFrom, statsFrom } from "./forestData.js";
-import { PROJECTS, COMPANIES, REGION } from "./data.js";
-import M from "./measurements.json" with { type: "json" };
+import {
+  COVARIATES, WINDOW, REFERENCE_PERIOD, matchControls, counterfactual, auditBaseline,
+  divergenceTimeline, lossFraction, forestAt, clearedBetween, RISK_BANDS,
+} from "./baseline.js";
+import { CASE_STUDIES, validateCaseStudy } from "./caseStudies.js";
+import { ACTORS, PARTIES, buildLedger, purchaseRows, verifierRecord } from "./actors.js";
+import { PROJECTS, REGION } from "./projects.js";
+import { parcelRing } from "./geometry.js";
+import { reportFileName } from "./report.js";
+import cellsDoc from "./cells.json" with { type: "json" };
 
-const pct = (x) => (x * 100).toFixed(1) + "%";
-const verdicts = PROJECTS.map((p) => {
-  const m = M.byProject[p.id];
-  assert(m, `${p.id} has no measurement`);
-  return { p, v: analyzeCovers(p, coversFrom(m, M.baseYear, M.endYear), statsFrom(m, M.baseYear)) };
-});
+const CELLS = cellsDoc.cells;
+const pct = (v) => (v * 100).toFixed(1) + "%";
+const tlFlagYear = (p, matches) => divergenceTimeline(p, matches).firstFlagYear;
 
-console.log(`source: ${M.source}`);
-console.log(`window: ${M.baseYear} → ${M.endYear} · canopy ≥ ${M.canopyThresholdPct}% · zoom ${M.zoom}\n`);
-console.log("id         grade  addl      lossProj  lossRing  $unsupported   confidence");
-for (const { p, v } of verdicts) {
+console.log(`source: ${cellsDoc.source}`);
+console.log(`${CELLS.length} control parcels · ${cellsDoc.cellDegrees}° · ${cellsDoc.firstYear}–${cellsDoc.lastYear}`);
+console.log(`covariates measured ${REFERENCE_PERIOD[0]}–${REFERENCE_PERIOD[1]}, outcomes ${WINDOW[0]}–${WINDOW[1]}\n`);
+
+// ── the control pool is physically coherent ────────────────────────────────
+assert(CELLS.length >= 150, `only ${CELLS.length} parcels — too few to match against`);
+for (const c of CELLS) {
+  assert(c.landKm2 > 0, `${c.id}: no land`);
+  assert(c.forest2008Km2 >= 0 && c.forest2008Km2 <= c.landKm2 + 1, `${c.id}: forest exceeds land`);
+  assert(c.protectedFrac >= 0 && c.protectedFrac <= 1, `${c.id}: bad protected fraction`);
+  const cleared = clearedBetween(c, cellsDoc.firstYear, cellsDoc.lastYear);
+  assert(cleared <= c.forest2008Km2 + 1, `${c.id}: cleared ${cleared} exceeds forest ${c.forest2008Km2}`);
+  // Forest can only fall: PRODES increments are cumulative clearing.
+  let prev = Infinity;
+  for (let y = cellsDoc.firstYear; y <= cellsDoc.lastYear; y++) {
+    const f = forestAt(c, y);
+    assert(f <= prev + 1e-6, `${c.id}: forest grew in ${y}`);
+    prev = f;
+  }
+}
+
+// ── every project is measured, matched and audited ─────────────────────────
+console.log("id       project                      claimed  independent  risk        controls  flagged");
+const seen = new Set();
+const bandsHit = new Set();
+for (const p of PROJECTS) {
+  assert(!seen.has(p.id), `duplicate project id ${p.id}`);
+  seen.add(p.id);
+  assert(p.parcel?.clearedByYear, `${p.id}: no measured footprint`);
+  assert(p.claimedBaselineLoss > 0 && p.claimedBaselineLoss < 1, `${p.id}: implausible baseline`);
+  assert(p.creditsRetired <= p.creditsIssued, `${p.id}: retired exceeds issued`);
+  // The panel renders a parties block and a credit ledger for every project, so
+  // a project the generator added but actors.js never heard of ships as a hole
+  // in the panel. Fail here instead, where the fix is one line in actors.js.
+  assert(PARTIES[p.id], `${p.id}: no parties in actors.js — add developer, verifier, registry and buyers`);
+  assert(buildLedger(p, 2020).length > 0, `${p.id}: ledger is empty`);
+  const rows = purchaseRows(p);
+  assert(
+    rows.reduce((s, r) => s + r.credits, 0) === p.creditsRetired,
+    `${p.id}: buyer shares do not reconcile to credits retired`
+  );
+  // Every purchase names the company that made it and the region it was made
+  // in. The panel, the map popup and the PDF all render this one sentence, so
+  // a purchase that cannot produce it is a hole in all three at once.
+  for (const r of rows) {
+    assert(r.actor?.name, `${p.id}: a credit purchase names no purchasing company`);
+    assert(r.region, `${p.id}: a credit purchase names no region`);
+    assert(
+      r.sentence === `${r.actor.name} purchased ${r.credits.toLocaleString("en-US")} credits in ${r.region}.`,
+      `${p.id}: purchase does not read as company, volume and region`
+    );
+  }
+
+  const host = CELLS.find((c) => c.id === p.hostCellId);
+  assert(host, `${p.id}: host parcel ${p.hostCellId} is not in the pool`);
+  const { matches, considered } = matchControls(host, CELLS);
+  // Most of the Legal Amazon is protected, so the unprotected pool is small and
+  // a handful of close matches is a realistic floor rather than a disappointing
+  // one. Eight is the floor `tools/make-projects.mjs` selects hosts against, and
+  // it is a floor on resolution: with n controls a claim can reach at most the
+  // (n-1)/n percentile, so eight still lets the top band be reached by the hosts
+  // ranked into it. Lower it further and the extreme claims stop registering.
+  assert(matches.length >= 8, `${p.id}: only ${matches.length} controls`);
+  assert(considered === CELLS.length, `${p.id}: pool size mismatch`);
+  // Controls must be genuinely independent of the project.
+  for (const m of matches) {
+    assert(m.cell.protectedFrac <= 0.25, `${p.id}: control ${m.cell.id} is protected`);
+    const d = Math.max(Math.abs(m.cell.center[0] - host.center[0]), Math.abs(m.cell.center[1] - host.center[1]));
+    assert(d > 1.5, `${p.id}: control ${m.cell.id} is inside the leakage buffer`);
+  }
+
+  const cf = counterfactual(matches);
+  assert(cf.p25 <= cf.median && cf.median <= cf.p75, `${p.id}: quantiles out of order`);
+  const audit = auditBaseline(p, cf);
+  assert(audit.creditsUnsupported >= 0 && audit.creditsUnsupported <= p.creditsIssued, `${p.id}: bad credit exposure`);
+  assert(audit.percentile >= 0 && audit.percentile <= 100, `${p.id}: bad percentile`);
+  bandsHit.add(audit.band.key);
+
+  const tl = divergenceTimeline(p, matches);
+  assert(tl.rows.length === WINDOW[1] - WINDOW[0] + 1, `${p.id}: timeline wrong length`);
+  for (let i = 1; i < tl.rows.length; i++)
+    assert(tl.rows[i].claimed >= tl.rows[i - 1].claimed - 1e-9, `${p.id}: claimed path decreases`);
+
   console.log(
-    `${p.id.padEnd(9)}  ${v.grade}      ${pct(v.additionality).padEnd(8)}  ` +
-      `${pct(v.lossProject).padEnd(8)}  ${pct(v.lossRing).padEnd(8)}  ` +
-      `$${Math.round(v.dollarsUnsupported).toLocaleString("en-US").padEnd(12)}  ${v.confidence.level}`
+    `${p.id}  ${p.shortName.padEnd(26)} ${pct(audit.claimed).padStart(7)}  ` +
+      `${pct(cf.median).padStart(11)}  ${audit.band.label.padEnd(10)}  ${String(cf.n).padStart(8)}  ` +
+      (tl.firstFlagYear ?? "—")
   );
 }
 
-const grades = verdicts.map((x) => x.v.grade).join("");
-const count = (g) => verdicts.filter((x) => x.v.grade === g).length;
-console.log(`\ngrades: ${grades}`);
+// ── the map frames every project, and reaches every parcel ─────────────────
+// Three boxes, nested, each answering a different question.
+//
+// `bounds` is what the overview frames, and it has to hold every project
+// FOOTPRINT - not every project centre. A frame drawn to the centres crops the
+// outer half of the outermost boundaries off the edge of the screen, which is
+// the same bug as hiding them under the panel and harder to notice.
+//
+// `reach` is everything the map can draw. Comparables are matched on covariates
+// rather than on distance, so any parcel in the grid can end up on screen, and
+// the pan barrier is built to contain this.
+//
+// `maxBounds` is only the barrier before the first frame lands; MapView derives
+// the real one from the overview camera. Assert it still has slack in it, and
+// that it stays regional - the point of deriving it was to stop a hand-written
+// box from either strangling the overview or opening onto the whole continent.
+{
+  const [[bw, bs], [be, bn]] = REGION.bounds;
+  const [[rw, rs], [re, rn]] = REGION.reach;
+  const [[mw, ms], [me, mn]] = REGION.maxBounds;
 
-// ── invariants the demo depends on ─────────────────────────────────────────
-assert(count("A") >= 1, "the index must be able to say a project is real");
-assert(count("F") >= 1, "the index must be able to fail a project");
-assert(new Set(grades).size >= 4, "grades must span the scale");
-assert(
-  verdicts.some((x) => x.v.confidence.level === "low"),
-  "the index must know what it cannot see"
-);
-assert(
-  verdicts.some((x) => x.v.additionality < 0),
-  "at least one project should have lost forest faster than its ring"
-);
+  assert(rw <= bw && rs <= bs && re >= be && rn >= bn, "REGION.reach does not contain REGION.bounds");
+  assert(mw < rw && ms < rs && me > re && mn > rn, "REGION.maxBounds does not contain REGION.reach");
+  assert(me - mw <= 180, "maxBounds spans half the world - this view is meant to stay regional");
+  assert(REGION.slack > 0 && REGION.slack < 1, `implausible REGION.slack ${REGION.slack}`);
 
-// Every measurement is real, complete, and large enough to mean something.
-for (const { p, v } of verdicts) {
-  const m = M.byProject[p.id];
-  assert(m.tilesFailed === 0, `${p.id}: ${m.tilesFailed} tiles failed`);
-  assert(v.stats.pixelsMeasured > 100000, `${p.id}: only ${v.stats.pixelsMeasured} px`);
-  assert(m.ring.total > m.project.total, `${p.id}: ring should be larger than project`);
-  for (const z of [m.project, m.ring]) {
-    assert(z.forest2000 <= z.total, `${p.id}: forest exceeds zone area`);
-    const lost = Object.values(z.lossByYear).reduce((a, b) => a + b, 0);
-    assert(lost <= z.forest2000, `${p.id}: loss exceeds year-2000 forest`);
+  for (const p of PROJECTS) {
+    const [w, s2, e, n] = p.parcel.bbox;
+    assert(w >= bw && e <= be && s2 >= bs && n <= bn, `${p.id} is not fully inside REGION.bounds`);
   }
-  // Cover can only fall: Hansen loss is cumulative and never reverts.
-  let prev = Infinity;
-  for (let y = M.baseYear; y <= M.endYear; y++) {
-    const c = coversFrom(m, y, y).coverProjectBase;
-    assert(c <= prev + 1e-9, `${p.id}: forest cover increased in ${y}`);
-    prev = c;
+  for (const c of CELLS) {
+    const [w, s2, e, n] = c.bbox;
+    assert(w >= rw && e <= re && s2 >= rs && n <= rn, `${c.id} sits outside REGION.reach`);
   }
+
+  // The overview is worth framing only if it is meaningfully tighter than the
+  // ground the map can reach; otherwise it is the old whole-grid frame again
+  // under a new name, and the projects go back to being dots in empty forest.
+  const tighter = ((re - rw) * (rn - rs)) / ((be - bw) * (bn - bs));
+  assert(tighter >= 1.5, `overview frames ${tighter.toFixed(2)}x the project box - it is framing the grid again`);
+  console.log(
+    `map frames ${(be - bw).toFixed(0)}x${(bn - bs).toFixed(0)} degrees of projects, ` +
+      `reaches ${(re - rw).toFixed(0)}x${(rn - rs).toFixed(0)} of parcels`
+  );
 }
 
-// Nothing fictional may collide with a real registry namespace.
-for (const p of PROJECTS) {
-  assert(/^AMZ-\d{4}$/.test(p.id), `${p.id} must use the demo namespace`);
-  const [lon, lat] = p.center;
-  const [[w, s], [e, n]] = REGION.maxBounds;
-  assert(lon > w && lon < e && lat > s && lat < n, `${p.id} sits outside the region`);
+// ── a drawn reference zone never claims ground it was not measured over ────
+// Reference parcels are drawn with the same harmonic outline as the project
+// blobs, so the map has one shape language and colour is the only thing that
+// separates a project from what it is compared with. The figures behind a
+// parcel are still summed over its one-degree box, so the outline is inscribed
+// in that box: it may understate the measured ground, never overstate it.
+for (const c of CELLS) {
+  const [w, s2, e, n] = c.bbox;
+  for (const [lon, lat] of parcelRing(c))
+    assert(
+      lon >= w - 1e-9 && lon <= e + 1e-9 && lat >= s2 - 1e-9 && lat <= n + 1e-9,
+      `${c.id}: drawn outline leaves the parcel its figures were measured over`
+    );
 }
 
-// Determinism: pure arithmetic over fixed data.
-const again = analyzeCovers(
-  PROJECTS[0],
-  coversFrom(M.byProject[PROJECTS[0].id], M.baseYear, M.endYear),
-  statsFrom(M.byProject[PROJECTS[0].id], M.baseYear)
+// ── the report names itself after the project and the day ──────────────────
+{
+  const day = new Date(2026, 7, 21);
+  for (const p of PROJECTS) {
+    const name = reportFileName(p, day);
+    assert(name.endsWith("-2026-08-21.pdf"), `${p.id}: report file name carries no date (${name})`);
+    assert(/^[a-z0-9-]+[.]pdf$/.test(name), `${p.id}: report file name is not filesystem-safe (${name})`);
+  }
+  console.log(`report exports as ${reportFileName(PROJECTS[0], day)}`);
+}
+
+// ── no real company is named anywhere ──────────────────────────────────────
+// The forest data is real; every company on screen is invented. A name that is
+// one letter from a real firm is a worse problem than a joke name, so this list
+// covers the obvious ones and the file stays reviewable by eye.
+const REAL_FIRMS = [
+  "verra", "gold standard", "south pole", "kariba", "sgs", "tuv", "tüv", "der norske",
+  "dnv", "bureau veritas", "aenor", "ruby canyon", "environmental services inc",
+  "delta-s", "first environment", "shell", "chevron", "bp ", "total", "eni ",
+  "nestl", "gucci", "volkswagen", "disney", "netflix", "salesforce", "microsoft",
+  "google", "apple ", "amazon.com", "delta air", "united airlines", "easyjet",
+  "lufthansa", "ryanair", "bhp", "rio tinto", "glencore", "vale ", "petrobras",
+];
+const actorText = JSON.stringify(ACTORS).toLowerCase();
+for (const firm of REAL_FIRMS)
+  assert(!actorText.includes(firm), `actors.js names a real firm ("${firm}") — every company here must be invented`);
+assert(ACTORS.every((a) => a.name && a.role && a.country), "an actor is missing a name, role or country");
+assert(new Set(ACTORS.map((a) => a.id)).size === ACTORS.length, "duplicate actor id");
+for (const role of ["developer", "verifier", "registry", "buyer"])
+  assert(ACTORS.some((a) => a.role === role), `no actor fills the ${role} role`);
+
+// A verifier's record has to be computable, since the panel shows it.
+for (const vid of new Set(Object.values(PARTIES).map((x) => x.verifier))) {
+  const rec = verifierRecord(vid, (pid) => {
+    const proj = PROJECTS.find((x) => x.id === pid);
+    const host = CELLS.find((c) => c.id === proj.hostCellId);
+    return auditBaseline(proj, counterfactual(matchControls(host, CELLS).matches));
+  });
+  assert(rec && rec.projects > 0, `${vid}: no portfolio record`);
+  assert(Number.isFinite(rec.meanDiscrepancyPts), `${vid}: mean discrepancy is not a number`);
+}
+console.log(`
+${ACTORS.length} parties, all invented · ledgers reconcile to the credit record`);
+
+// ── the index must be able to say different things ─────────────────────────
+assert(bandsHit.size >= 3, `risk bands collapse: only ${[...bandsHit].join(", ")}`);
+assert(
+  PROJECTS.some((p) => {
+    const host = CELLS.find((c) => c.id === p.hostCellId);
+    const { matches } = matchControls(host, CELLS);
+    return auditBaseline(p, counterfactual(matches)).band.key === "consistent";
+  }),
+  "no project comes back consistent — the tool must be able to clear one"
 );
-assert.equal(again.additionality, verdicts[0].v.additionality, "non-deterministic");
 
-// Portfolios resolve and never claim more unsupported spend than was spent.
-for (const c of COMPANIES) {
-  const byId = Object.fromEntries(verdicts.map((x) => [x.p.id, x.v]));
-  const r = analyzeHoldings(c.holdings, byId);
-  assert.equal(r.rows.length, c.holdings.length, `${c.name}: unresolved holding`);
-  assert(r.totalUnsupported <= r.totalSpend + 1e-6, `${c.name}: unsupported exceeds spend`);
-  assert(r.totalUnsupported >= 0, `${c.name}: negative unsupported`);
+// ── matching uses only pre-window information ──────────────────────────────
+// A covariate that reads the outcome window would make the comparison circular.
+const src = (await import("node:fs")).readFileSync(new URL("./baseline.js", import.meta.url), "utf8");
+const covBlock = src.slice(src.indexOf("export const COVARIATES"), src.indexOf("export function covariateStats"));
+assert(!/WINDOW\[/.test(covBlock), "a covariate reads the outcome window — matching would be circular");
+
+// ── nothing claims anything about a real party ─────────────────────────────
+const REAL_ENTITIES = ["verra", "kariba", "south pole", "volkswagen", "nestl", "gucci", "vcs-", "gold standard"];
+const projectText = JSON.stringify(PROJECTS).toLowerCase();
+for (const e of REAL_ENTITIES)
+  assert(!projectText.includes(e), `projects.js names a real entity ("${e}") — that belongs in a sourced case study`);
+
+for (const cs of CASE_STUDIES) {
+  const problems = validateCaseStudy(cs, PROJECTS.map((p) => p.id));
+  assert(problems.length === 0, `case study ${cs.projectId}:\n  - ${problems.join("\n  - ")}`);
 }
+console.log(`\n${CASE_STUDIES.length} case studies, all validated`);
 
-const totalUnsupported = verdicts.reduce((s, x) => s + x.v.dollarsUnsupported, 0);
-const totalCredits = PROJECTS.reduce((s, p) => s + p.creditsIssued, 0);
+const totalForest = CELLS.reduce((s, c) => s + c.forest2008Km2, 0);
 console.log(
-  `${PROJECTS.length} projects · ${totalCredits.toLocaleString("en-US")} credits · ` +
-    `$${Math.round(totalUnsupported).toLocaleString("en-US")} unsupported at $${PRICE_PER_CREDIT}/credit`
+  `${Math.round(totalForest).toLocaleString("en-US")} km² of forest across the pool · ` +
+    `${COVARIATES.length} covariates · bands seen: ${[...bandsHit].join(", ")}`
 );
-const low = verdicts.find((x) => x.v.confidence.level === "low");
-console.log(`low-confidence case: ${low.p.id} (${low.p.name}) — ${low.v.confidence.factors.find((f) => f.key === "signal").value}`);
 console.log("\nself-check passed.");

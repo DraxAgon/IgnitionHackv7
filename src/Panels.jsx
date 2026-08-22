@@ -1,417 +1,520 @@
-// Panels.jsx — everything that floats over the map.
-import { useMemo, useState } from "react";
-import { PROJECTS, COMPANIES } from "./data.js";
-import { VERDICTS, verdictById, projectById, historyFor, MEASUREMENT_META, measurementFor, verdictFor } from "./verdicts.js";
-import { analyzeHoldings, PRICE_PER_CREDIT, CANOPY_THRESHOLD_PCT } from "./engine.js";
-import { measureZones } from "./forestData.js";
+// Panels.jsx — the one panel that matters, plus the hidden settings popover.
+//
+// The rule that shaped this file: if a sentence only explains the method, it
+// belongs in the report, not on screen. A buyer looking at this has one question
+// — is this baseline worth what I am about to pay for it — and every line that
+// does not move them toward an answer is competing with the lines that do.
+//
+// So the panel is seven blocks in a fixed order: who and where, the verdict in
+// one sentence, the three figures behind it, the year-by-year evidence, the
+// money exposed, who signed it off, and the report. Method, provenance and
+// matching criteria live behind one collapsed row.
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CELLS } from "./cells.js";
+import { PROJECTS } from "./projects.js";
+import { caseStudyFor } from "./caseStudies.js";
 import {
-  Grade, Confidence, Toggle, LossCurve, SplitBar, GRADE_COLORS, GRADE_ORDER, CONF_COLORS,
-  fmtInt, fmtMoney, fmtCompact, fmtPct, fmtHa,
-} from "./ui.jsx";
+  ACTORS, ROLE_LABEL, actorById, buildLedger, purchaseRows, noteForRole, partiesFor, verifierRecord,
+} from "./actors.js";
+import {
+  COVARIATES, WINDOW, REFERENCE_PERIOD, matchControls, counterfactual,
+  auditBaseline, divergenceTimeline, lossFraction,
+} from "./baseline.js";
+// Shared with the exported report, so a reader checking the PDF against this
+// screen is comparing the same roundings rather than two of them.
+import { pct, pts, compact, money, full } from "./format.js";
 
-const { baseYear, endYear } = MEASUREMENT_META;
-const pctS = (x) => (x * 100).toFixed(1);
-
-/* ── left: layers, scrubber, filters ─────────────────────────────────────── */
-export function Controls({ layers, setLayers, year, setYear, filters, setFilters, selectedId }) {
-  const set = (k) => (v) => setLayers((l) => ({ ...l, [k]: v }));
-  const toggleGrade = (g) =>
-    setFilters((f) => ({ ...f, grades: f.grades.includes(g) ? f.grades.filter((x) => x !== g) : [...f.grades, g] }));
-
-  return (
-    <aside className="panel panel-left">
-      <div className="panel-head">
-        <div className="panel-title">Map layers</div>
-      </div>
-      <div className="panel-body">
-        <div className="section">
-          <Toggle label="Tree cover loss" note="UMD/Hansen, 2001–2023" checked={layers.loss} onChange={set("loss")} />
-          <Toggle label="Canopy extent 2000" note={`baseline, ≥${CANOPY_THRESHOLD_PCT}% cover`} checked={layers.canopy} onChange={set("canopy")} />
-          <Toggle label="Project boundaries" checked={layers.projects} onChange={set("projects")} />
-          <Toggle label="Counterfactual rings" note="5–20 km, cushion excluded" checked={layers.rings} onChange={set("rings")} />
-          <Toggle label="Grade markers" checked={layers.pins} onChange={set("pins")} />
-        </div>
-
-        <div className="section">
-          <div className="section-title">Forest change replay</div>
-          {selectedId ? (
-            <>
-              <Toggle label="Decoded change overlay" note="measured pixels, this project" checked={layers.change} onChange={set("change")} />
-              <div style={{ marginTop: 10 }}>
-                <div className="row" style={{ padding: "0 0 7px" }}>
-                  <span className="row-label">Year</span>
-                  <span className="mono" style={{ fontSize: 15, fontWeight: 600 }}>{year}</span>
-                </div>
-                <input
-                  className="range" type="range" min={baseYear} max={endYear} step={1}
-                  value={year} onChange={(e) => setYear(+e.target.value)}
-                  aria-label="Forest change year"
-                />
-                <div className="row" style={{ padding: "5px 0 0" }}>
-                  <span className="row-note">{baseYear}</span>
-                  <span className="row-note">{endYear}</span>
-                </div>
-                <div className="notice" style={{ marginTop: 9 }}>
-                  Drag to replay recorded clearing. Red is loss inside the crediting window; brown was already gone before it opened.
-                </div>
-              </div>
-            </>
-          ) : (
-            <div className="notice">Select a project to replay its measured forest loss year by year.</div>
-          )}
-        </div>
-
-        <div className="section">
-          <div className="section-title">Filter by grade</div>
-          <div className="filter-row">
-            {GRADE_ORDER.map((g) => (
-              <button
-                key={g} className="filter-btn" aria-pressed={filters.grades.includes(g)}
-                onClick={() => toggleGrade(g)}
-                style={filters.grades.includes(g) ? { color: GRADE_COLORS[g], borderColor: GRADE_COLORS[g] } : undefined}
-              >
-                {g}
-              </button>
-            ))}
-            {filters.grades.length > 0 && (
-              <button className="filter-btn" onClick={() => setFilters((f) => ({ ...f, grades: [] }))}>clear</button>
-            )}
-          </div>
-        </div>
-      </div>
-    </aside>
-  );
+/** Run the audit for a project. Pure and instant — the delay in the UI is
+ *  theatre for the viewer's benefit, not computation. */
+export function auditFor(project) {
+  // Match at parcel resolution — the controls are one-degree parcels, so the
+  // target must be one too. Observed loss comes from the project's own footprint.
+  const host = CELLS.find((c) => c.id === project.hostCellId) ?? project.parcel;
+  const { matches, considered } = matchControls(host, CELLS);
+  const cf = counterfactual(matches);
+  const audit = auditBaseline(project, cf);
+  const timeline = divergenceTimeline(project, matches);
+  const observedInside = lossFraction(project.parcel, WINDOW[0], WINDOW[1]);
+  return { host, matches, considered, cf, audit, timeline, observedInside };
 }
 
-/* ── right: ranked index ─────────────────────────────────────────────────── */
-const SORTS = {
-  unsupported: ["$ unsupported", (a, b) => b.verdict.dollarsUnsupported - a.verdict.dollarsUnsupported],
-  additionality: ["Additionality", (a, b) => a.verdict.additionality - b.verdict.additionality],
-  credits: ["Credits issued", (a, b) => b.project.creditsIssued - a.project.creditsIssued],
-  name: ["Name", (a, b) => a.project.name.localeCompare(b.project.name)],
+/** The audit for any project, by id — used for a verifier's whole portfolio. */
+const auditById = (projectId) => {
+  const p = PROJECTS.find((x) => x.id === projectId);
+  return p ? auditFor(p).audit : null;
 };
 
-export function ProjectList({ onSelect, filters, setFilters, sort, setSort }) {
-  const rows = useMemo(() => {
-    const q = filters.q.trim().toLowerCase();
-    return VERDICTS.filter(
-      ({ project, verdict }) =>
-        (!filters.grades.length || filters.grades.includes(verdict.grade)) &&
-        (!q || project.name.toLowerCase().includes(q) || project.id.toLowerCase().includes(q) || project.state.toLowerCase().includes(q))
-    ).sort(SORTS[sort][1]);
-  }, [filters, sort]);
-
-  const shown = rows.reduce((s, r) => s + r.verdict.dollarsUnsupported, 0);
-
+/* ── the verification sequence ───────────────────────────────────────────── */
+function Verification({ result, phase, ticked }) {
+  if (phase !== "running") return null;
   return (
-    <aside className="panel panel-right">
-      <div className="panel-head">
-        <div className="panel-title">The index</div>
-        <div className="panel-h1">{rows.length} of {PROJECTS.length} projects</div>
-        <div className="panel-sub">
-          <span className="num" style={{ color: "var(--danger)" }}>{fmtMoney(shown)}</span> of credit value unsupported
+    <div className="sec">
+      <div className="sec-title">Matching on pre-window characteristics</div>
+      {COVARIATES.map((cv, i) => (
+        <div key={cv.key} className={`check${ticked > i ? " on" : ""}`}>
+          <span className="check-box">{ticked > i ? "✓" : ""}</span>
+          {cv.label}
         </div>
-        <input
-          className="search" style={{ marginTop: 11 }} placeholder="Search name, ID or state"
-          value={filters.q} onChange={(e) => setFilters((f) => ({ ...f, q: e.target.value }))}
-        />
-        <div className="filter-row" style={{ marginTop: 9 }}>
-          {Object.entries(SORTS).map(([k, [label]]) => (
-            <button key={k} className="filter-btn" aria-pressed={sort === k} onClick={() => setSort(k)}>{label}</button>
-          ))}
-        </div>
-      </div>
-      <div className="panel-body">
-        <div className="list">
-          {rows.map(({ project, verdict }, i) => (
-            <button key={project.id} className="item" onClick={() => onSelect(project.id)}>
-              <span className="item-rank">{i + 1}</span>
-              <span className="item-main">
-                <span className="item-name">{project.name}</span>
-                <span className="item-meta">
-                  {project.id} · {fmtPct(verdict.additionality, 0)} additional · {fmtCompact(verdict.dollarsUnsupported)}
-                </span>
-              </span>
-              <Grade g={verdict.grade} />
-            </button>
-          ))}
-          {!rows.length && <div className="panel-pad notice">No projects match those filters.</div>}
-        </div>
-      </div>
-    </aside>
+      ))}
+    </div>
   );
 }
 
-/* ── right: the evidence ─────────────────────────────────────────────────── */
-export function Detail({ id, onBack, year }) {
-  const project = projectById[id];
-  const verdict = verdictById[id];
-  const [live, setLive] = useState(null);
-  const history = useMemo(() => historyFor(id), [id]);
-  const gc = GRADE_COLORS[verdict.grade];
-  const c = verdict.covers;
-  const flagged = !["A", "B"].includes(verdict.grade);
+/* ── results ─────────────────────────────────────────────────────────────── */
+function Results({ project, result, year, snapshotMap }) {
+  const { audit, cf, timeline, observedInside } = result;
+  const study = caseStudyFor(project.id);
+  const parties = partiesFor(project.id);
+  const [showMethod, setShowMethod] = useState(false);
 
-  async function verifyLive() {
-    setLive({ status: "running", done: 0, total: 1 });
+  // The verdict, in the units a buyer transacts in. This is the largest text in
+  // the panel because it is the only sentence most readers will finish.
+  const verdict = audit.creditsUnsupported > 0
+    ? `${compact(audit.creditsUnsupported)} of ${compact(audit.creditsIssued)} credits are not supported by satellite evidence.`
+    : `The claimed baseline is consistent with what comparable land actually did.`;
+
+  const ledger = useMemo(
+    () => buildLedger(project, timeline.firstFlagYear),
+    [project.id, timeline.firstFlagYear]
+  );
+  const record = useMemo(
+    () => (parties ? verifierRecord(parties.verifier, auditById) : null),
+    [project.id]
+  );
+
+  // Year-by-year, truncated at the year the map is showing, so the panel and the
+  // map are never telling the viewer about different points in time.
+  const rows = timeline.rows.filter((r) => r.year <= year);
+  const scale = Math.max(...timeline.rows.map((r) => Math.max(r.claimed, r.observed))) * 1.1 || 1;
+
+  return (
+    <>
+      {/* 2 — the verdict */}
+      <div className="sec">
+        <div className="verdict" style={{ color: audit.band.color }}>{verdict}</div>
+        <div className="verdict-sub">
+          Over {WINDOW[0]}–{WINDOW[1]}, measured against {cf.n} comparable unprotected parcels.
+        </div>
+      </div>
+
+      {/* 3 — the three figures the verdict rests on */}
+      <div className="sec">
+        <div className="figures">
+          <div className="figure">
+            <div className="figure-k">Project's baseline</div>
+            <div className="figure-v" style={{ color: "var(--loss)" }}>{pct(audit.claimed)}</div>
+          </div>
+          <div className="figure">
+            <div className="figure-k">Independent estimate</div>
+            <div className="figure-v" style={{ color: "var(--control-ink)" }}>{pct(audit.independent)}</div>
+          </div>
+          <div className="figure">
+            <div className="figure-k">Discrepancy</div>
+            <div className="figure-v" style={{ color: audit.band.color }}>{pts(audit.discrepancyPts)}</div>
+          </div>
+        </div>
+        <div className="notice" style={{ marginTop: 10 }}>
+          Predicted loss without the project, against what {cf.n} comparable parcels actually lost.
+          The project's own area lost {pct(observedInside)}.
+        </div>
+      </div>
+
+      {/* 4 — the evidence, year by year */}
+      <div className="sec">
+        <div className="sec-title">Claimed pace against comparable land</div>
+        {rows.map((r) => (
+          <div className="tl-row" key={r.year}>
+            <span className="tl-year">{r.year}</span>
+            <span className="tl-bars">
+              <i style={{ top: 1, width: `${(r.claimed / scale) * 100}%`, background: "var(--loss)", opacity: 0.8 }} />
+              <i style={{ top: 9, width: `${(r.observed / scale) * 100}%`, background: "var(--control-ink)" }} />
+            </span>
+          </div>
+        ))}
+        <div className="notice" style={{ marginTop: 8 }}>
+          <span style={{ color: "var(--loss)" }}>■</span> claimed ·{" "}
+          <span style={{ color: "var(--control-ink)" }}>■</span> comparable unprotected land
+        </div>
+        {timeline.firstFlagYear && (
+          <div className="flagbox">
+            Detectable from <b>{timeline.firstFlagYear}</b> — <b>{timeline.yearsOfWarning} years</b> before
+            the window closed, while credits were still being issued and retired.
+          </div>
+        )}
+      </div>
+
+      {/* 5 — the money */}
+      <div className="sec">
+        <div className="sec-title">Exposure</div>
+        <div className="stats">
+          <div className="stat">
+            <div className="stat-k">Not supported</div>
+            <div className="stat-v" style={{ color: audit.band.color }}>{compact(audit.creditsUnsupported)}</div>
+          </div>
+          <div className="stat">
+            <div className="stat-k">At ${audit.pricePerCredit.toFixed(2)}</div>
+            <div className="stat-v" style={{ color: audit.band.color }}>{money(audit.valueUnsupported)}</div>
+          </div>
+        </div>
+        <div className="notice" style={{ marginTop: 9 }}>
+          <b>{compact(audit.creditsRetired)}</b> of the {compact(audit.creditsIssued)} issued are already
+          retired against buyers' targets and cannot be reversed.
+        </div>
+      </div>
+
+      {/* 6 — who is involved */}
+      {parties && <Parties project={project} parties={parties} record={record} ledger={ledger} audit={audit} />}
+
+      {/* 7 — the report */}
+      <ExportReport project={project} result={result} year={year} record={record} snapshotMap={snapshotMap} />
+
+      {study && <CaseStudy study={study} />}
+
+      {/* everything methodological, behind one row */}
+      <div className="sec">
+        <button className="disclose" aria-expanded={showMethod} onClick={() => setShowMethod((v) => !v)}>
+          <span>How we measured this</span>
+          <span className="disclose-mark">{showMethod ? "−" : "+"}</span>
+        </button>
+        {showMethod && (
+          <div className="notice" style={{ marginTop: 10 }}>
+            The project's parcel is described by {COVARIATES.length} characteristics measured over{" "}
+            {REFERENCE_PERIOD[0]}–{REFERENCE_PERIOD[1]}, before the crediting window opened, so nothing
+            about the outcome can leak into the comparison. Unprotected parcels resembling it are then
+            observed over {WINDOW[0]}–{WINDOW[1]}. {result.matches.length} matched from {result.considered}{" "}
+            candidates; parcels within 1.5° are excluded so displaced clearing cannot flatter the result.
+            <br /><br />
+            Deforestation is INPE PRODES, the official Brazilian Amazon record. This is a screening
+            estimate from public data, not an audit and not a determination about any party.
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/* ── the parties, and the paper trail ────────────────────────────────────── */
+function Parties({ project, parties, record, ledger, audit }) {
+  const [open, setOpen] = useState(false);
+  const dev = actorById(parties.developer);
+  const vvb = actorById(parties.verifier);
+  const reg = actorById(parties.registry);
+  const buys = purchaseRows(project);
+  const boughtCredits = buys.reduce((t, r) => t + r.credits, 0);
+  const boughtValue = buys.reduce((t, r) => t + r.priceUsd, 0);
+
+  const Row = ({ actor, role, extra }) => (
+    <div className="party">
+      <div className="party-role">{ROLE_LABEL[role]}</div>
+      <div className="party-name">{actor.name}</div>
+      {extra && <div className="party-extra">{extra}</div>}
+    </div>
+  );
+
+  return (
+    <div className="sec">
+      <div className="sec-title">Who signed this off</div>
+      <Row actor={dev} role="developer" extra={`${dev.country} · wrote the baseline and sells the credits`} />
+      <Row
+        actor={vvb}
+        role="verifier"
+        extra={
+          record
+            ? `${vvb.country} · engaged and paid by the developer · signed off ${record.projects} projects here, averaging ${pts(record.meanDiscrepancyPts)} discrepancy`
+            : `${vvb.country} · engaged and paid by the developer`
+        }
+      />
+      <Row actor={reg} role="registry" extra={`${reg.country} · holds the retirement record`} />
+
+      {/* Who bought them, not just how many were sold here. A region cannot be
+          asked what diligence it did; a company can, and this is the only row
+          on the screen a buyer can act on. */}
+      <div className="sec-title" style={{ marginTop: 13 }}>Credit purchases</div>
+      <div className="buys">
+        {buys.map(({ actor, credits, region, priceUsd }) => (
+          <div className="buy" key={actor.id}>
+            <div className="buy-line">
+              <b>{actor.name}</b> purchased {full(credits)} credits in {region}.
+            </div>
+            <div className="buy-meta">
+              {actor.country} · {money(priceUsd)} · retired<i className="lock" aria-label="irreversible" />
+            </div>
+          </div>
+        ))}
+        <div className="buy-total">
+          <span>
+            {buys.length} {buys.length === 1 ? "company" : "companies"} · {full(boughtCredits)} credits
+            {buys.length > 0 && ` in ${buys[0].region}`}
+          </span>
+          <b>{money(boughtValue)}</b>
+        </div>
+      </div>
+
+      <button className="disclose" aria-expanded={open} onClick={() => setOpen((v) => !v)} style={{ marginTop: 10 }}>
+        <span>Credit history</span>
+        <span className="disclose-mark">{open ? "−" : "+"}</span>
+      </button>
+      {open && (
+        <div className="ledger">
+          {ledger.map((e, i) => {
+            const actor = e.actorId ? actorById(e.actorId) : null;
+            const flag = e.type === "phantom_flag";
+            return (
+              <div className={`ledger-row${flag ? " is-flag" : ""}`} key={`${e.date}-${i}`}>
+                <span className="ledger-date">{e.date}</span>
+                <span className="ledger-body">
+                  <span className="ledger-label">
+                    {e.label}
+                    {e.type === "retirement" && <i className="lock" aria-label="irreversible" />}
+                  </span>
+                  {actor && <span className="ledger-actor">{actor.name}</span>}
+                  {e.credits != null && (
+                    <span className="ledger-credits">
+                      {compact(e.credits)}
+                      {e.region ? ` credits in ${e.region}` : ""}
+                      {e.vintage ? ` · vintage ${e.vintage}` : ""}
+                      {e.priceUsd ? ` · ${money(e.priceUsd)}` : ""}
+                    </span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div className="notice" style={{ marginTop: 9 }}>
+        Company names on this screen are illustrative and describe no real party. The forest
+        measured under and around the project is real.
+      </div>
+    </div>
+  );
+}
+
+/* ── the report, as a file ───────────────────────────────────────────────── */
+/**
+ * A button that cannot produce a file is worse than no button, so this one says
+ * which file it produced — and says so when it produced none.
+ *
+ * The map goes in as it is framed at the moment of the click, not re-rendered
+ * to some canonical view: the export is meant to be the report the reader is
+ * looking at, including where they had put the camera and which year they had
+ * scrubbed to.
+ */
+function ExportReport({ project, result, year, record, snapshotMap }) {
+  const [state, setState] = useState({ phase: "idle" });
+
+  async function download() {
+    setState({ phase: "working" });
     try {
-      const m = await measureZones(project, {
-        zoom: MEASUREMENT_META.zoom,
-        onProgress: (done, total) => setLive({ status: "running", done, total }),
+      // jsPDF is the biggest dependency here and most sessions never export, so
+      // the module is fetched on the click rather than at first paint.
+      const { downloadReport } = await import("./report.js");
+      const name = await downloadReport({
+        project,
+        result,
+        year,
+        record,
+        mapImage: snapshotMap?.() ?? null,
       });
-      const v = verdictFor(project, m);
-      setLive({ status: "done", additionality: v.additionality, grade: v.grade, tiles: m.tiles, failed: m.tilesFailed });
-    } catch {
-      setLive({ status: "error" });
+      setState({ phase: "done", name });
+    } catch (err) {
+      console.error("report export failed", err);
+      setState({ phase: "failed" });
     }
   }
 
-  const rows = [
-    ["1", "project", `Forest cover · project · ${baseYear}`, `canopy pixels ÷ polygon pixels`, pctS(c.coverProjectBase) + "%"],
-    ["2", "project", `Forest cover · project · ${endYear}`, `canopy pixels ÷ polygon pixels`, pctS(c.coverProjectEnd) + "%"],
-    ["3", "ring", `Forest cover · ring · ${baseYear}`, `canopy pixels ÷ ring pixels`, pctS(c.coverRingBase) + "%"],
-    ["4", "ring", `Forest cover · ring · ${endYear}`, `canopy pixels ÷ ring pixels`, pctS(c.coverRingEnd) + "%"],
-    ["5", "project", "Loss inside the project", `(${pctS(c.coverProjectBase)} − ${pctS(c.coverProjectEnd)}) ÷ ${pctS(c.coverProjectBase)}`, pctS(verdict.lossProject) + "%"],
-    ["6", "ring", "Loss in the ring", `(${pctS(c.coverRingBase)} − ${pctS(c.coverRingEnd)}) ÷ ${pctS(c.coverRingBase)}`, pctS(verdict.lossRing) + "%"],
-    ["7", "both", "Actually protected", `${pctS(verdict.lossRing)} − ${pctS(verdict.lossProject)}`, pctS(verdict.actuallyProtected) + " pts"],
-    ["8", "verdict", "Additionality", `${pctS(verdict.actuallyProtected)} ÷ ${pctS(project.claimedBaselineLoss)} claimed`, fmtPct(verdict.additionality)],
-  ];
-  const dotColor = { project: "#e7eef3", ring: "#4fa8d8", both: "#a78bfa", verdict: gc };
-
   return (
-    <aside className="panel panel-right">
-      <div className="panel-head">
-        <button className="back" onClick={onBack}>← all projects</button>
-        <div className="panel-h1" style={{ marginTop: 7 }}>{project.name}</div>
-        <div className="panel-sub mono">
-          {project.id} · {project.state} · {fmtHa(project.areaHa)}
-        </div>
-        <div
-          className="chip" style={{
-            marginTop: 10, boxShadow: "none", padding: "5px 10px",
-            color: flagged ? "var(--warn)" : "var(--A)",
-            borderColor: (flagged ? "#e8b931" : "#2fbf71") + "55",
-            background: (flagged ? "#e8b931" : "#2fbf71") + "12",
-          }}
-        >
-          {flagged ? "flagged for field verification" : "screening passed — no field audit triggered"}
-        </div>
+    <div className="sec">
+      <div className="sec-title">Report</div>
+      <button className="btn" onClick={download} disabled={state.phase === "working"}>
+        {state.phase === "working" ? <><i className="spin" /> building report</> : "Download PDF"}
+      </button>
+      <div className="notice" style={{ marginTop: 9 }}>
+        {state.phase === "done" ? (
+          <>Saved as <b className="mono">{state.name}</b></>
+        ) : state.phase === "failed" ? (
+          "The report could not be built, and nothing was saved. The figures on this screen are unaffected."
+        ) : (
+          <>
+            The verdict, the three figures, the year-by-year evidence, the map as it is framed right
+            now, and who bought the credits — as one file to send on.
+          </>
+        )}
       </div>
-
-      <div className="panel-body">
-        <div className="section">
-          <div className="verdict-top">
-            <Grade g={verdict.grade} size="lg" />
-            <div>
-              <div className="verdict-pct" style={{ color: gc }}>{fmtPct(verdict.additionality)}</div>
-              <div className="verdict-cap">additionality vs claimed baseline</div>
-            </div>
-          </div>
-          <div className="kpis">
-            <div className="kpi"><div className="kpi-label">Credits issued</div><div className="kpi-val">{fmtInt(project.creditsIssued)}</div></div>
-            <div className="kpi"><div className="kpi-label">Credits unsupported</div><div className="kpi-val" style={{ color: "var(--danger)" }}>{fmtInt(verdict.creditsUnsupported)}</div></div>
-            <div className="kpi"><div className="kpi-label">Value unsupported</div><div className="kpi-val" style={{ color: "var(--danger)" }}>{fmtMoney(verdict.dollarsUnsupported)}</div></div>
-            <div className="kpi"><div className="kpi-label">Confidence</div><div className="kpi-val"><Confidence level={verdict.confidence.level} /></div></div>
-          </div>
-        </div>
-
-        <div className="section">
-          <div className="section-title">Forest cover · project vs ring</div>
-          <LossCurve series={history} windowStart={baseYear} grade={verdict.grade} year={year} />
-          <div className="notice" style={{ marginTop: 7 }}>
-            <span style={{ color: gc }}>──</span> inside the project ·{" "}
-            <span style={{ color: "var(--accent)" }}>┄┄</span> counterfactual ring. The shaded gap is what the
-            project can claim. Years before {baseYear} show whether the two were ever alike.
-          </div>
-        </div>
-
-        <div className="section">
-          <div className="section-title">The whole calculation</div>
-          <div className="notice" style={{ marginBottom: 10 }}>
-            Claim on file: <em>“without this project, {pctS(project.claimedBaselineLoss)}% of forest cover is lost
-            by {endYear}.”</em> Four measurements, three subtractions, one division — no model.
-          </div>
-          <div className="ladder">
-            {rows.map(([n, zone, label, math, out]) => (
-              <div key={n} className={`lad${n === "8" ? " lad-final" : ""}`}>
-                <span className="lad-n">{n}</span>
-                <span className="lad-dot" style={{ background: dotColor[zone] }} />
-                <span>
-                  <span className="lad-label">{label}</span>
-                  <span className="lad-math">{math}</span>
-                </span>
-                <span className="lad-out" style={{ color: n === "8" ? gc : "var(--ink)" }}>{out}</span>
-              </div>
-            ))}
-          </div>
-          <div className="money">
-            {fmtInt(project.creditsIssued)} × (1 − {pctS(Math.min(Math.max(verdict.additionality, 0), 1))}%) × ${PRICE_PER_CREDIT}
-            <br />= <strong style={{ color: "var(--danger)" }}>{fmtMoney(verdict.dollarsUnsupported)} unsupported</strong>
-          </div>
-        </div>
-
-        <div className="section">
-          <div className="section-title">Confidence · {verdict.confidence.level}</div>
-          {verdict.confidence.factors.map((f) => (
-            <div key={f.key} className="conf-item">
-              <span className="conf-bar" style={{ background: f.penalty === 0 ? "#2a353d" : f.penalty === 1 ? "var(--warn)" : "var(--danger)" }} />
-              <div style={{ flex: 1 }}>
-                <div className="conf-name"><span>{f.label}</span><span className="conf-val">{f.value}</span></div>
-                <div className="conf-detail">{f.detail}</div>
-              </div>
-            </div>
-          ))}
-          {verdict.confidence.level === "low" && (
-            <div className="money" style={{ background: "rgba(229,72,77,.07)", fontFamily: "var(--sans)", fontSize: 12 }}>
-              Low confidence means <strong>we cannot resolve this project from orbit</strong> — read the grade as
-              insufficient evidence, never as misconduct.
-            </div>
-          )}
-        </div>
-
-        <div className="section">
-          <div className="section-title">Verify</div>
-          <div className="notice" style={{ marginBottom: 10 }}>
-            The figures above were measured from {MEASUREMENT_META.source.split(",")[0]} on {MEASUREMENT_META.measuredAt}.
-            Re-run the same read against the live tile service now.
-          </div>
-          <button className="btn btn-accent btn-block" onClick={verifyLive} disabled={live?.status === "running"}>
-            {live?.status === "running" ? <><i className="spin" /> reading {live.done}/{live.total} tiles</> : "Re-measure from live satellite tiles"}
-          </button>
-          {live?.status === "done" && (
-            <div className="money" style={{ background: "rgba(47,191,113,.07)", borderColor: "rgba(47,191,113,.25)" }}>
-              live: {fmtPct(live.additionality)} · grade {live.grade} · {live.tiles} tiles, {live.failed} failed
-              <br />
-              bundled: {fmtPct(verdict.additionality)} · grade {verdict.grade}
-              <br />
-              <strong style={{ color: Math.abs(live.additionality - verdict.additionality) < 0.005 ? "var(--A)" : "var(--warn)" }}>
-                {Math.abs(live.additionality - verdict.additionality) < 0.005 ? "match" : "differs — tile service updated"}
-              </strong>
-            </div>
-          )}
-          {live?.status === "error" && <div className="notice" style={{ marginTop: 8, color: "var(--danger)" }}>Live read failed — offline or the tile service is unreachable.</div>}
-        </div>
-      </div>
-    </aside>
+    </div>
   );
 }
 
-/* ── right: buyers ───────────────────────────────────────────────────────── */
-export function Buyers({ onSelect }) {
-  const [companyId, setCompanyId] = useState(COMPANIES[0].id);
-  const company = COMPANIES.find((c) => c.id === companyId);
-  const result = useMemo(() => analyzeHoldings(company.holdings, verdictById), [company]);
-  const share = result.totalSpend ? result.totalUnsupported / result.totalSpend : 0;
+function CaseStudy({ study }) {
+  return (
+    <div className="sec">
+      <div className="sec-title">Case study</div>
+      <div className="p-name" style={{ fontSize: 15 }}>{study.headline}</div>
+      <p className="notice" style={{ marginTop: 7, fontSize: 12.5, color: "var(--ink-2)" }}>{study.standfirst}</p>
+      {study.sources?.length > 0 && (
+        <div className="notice" style={{ marginTop: 12 }}>
+          Sources:{" "}
+          {study.sources.map((s, i) => (
+            <span key={s.id}>
+              {i > 0 && " · "}
+              <a href={s.url} target="_blank" rel="noreferrer">{s.publisher}</a>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
-  function exportFindings() {
-    const payload = {
-      generatedBy: "Phantom — screening index for forest carbon projects",
-      disclaimer: "Projects, registry IDs and companies are fictional. Forest measurements are real: " + MEASUREMENT_META.source,
-      measurementWindow: `${baseYear}-${endYear}`,
-      portfolio: company.name,
-      totalSpendUsd: Math.round(result.totalSpend),
-      unsupportedSpendUsd: Math.round(result.totalUnsupported),
-      holdings: result.rows.map((r) => ({
-        projectId: r.projectId, projectName: projectById[r.projectId].name,
-        grade: r.verdict.grade, additionality: +r.verdict.additionality.toFixed(4),
-        confidence: r.verdict.confidence.level, credits: r.credits, pricePerCredit: r.pricePerCredit,
-        spendUsd: Math.round(r.spend), unsupportedUsd: Math.round(r.unsupported),
-        status: ["A", "B"].includes(r.verdict.grade) ? "screening passed" : "flagged for field verification",
-      })),
-    };
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
-    a.download = `phantom-${company.id}-audit.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+/* ── the panel ───────────────────────────────────────────────────────────── */
+export function ProjectPanel({ id, year, onClose, onVerified, snapshotMap }) {
+  const project = PROJECTS.find((p) => p.id === id);
+  const result = useMemo(() => auditFor(project), [id]);
+  const [phase, setPhase] = useState("idle");
+  const [ticked, setTicked] = useState(0);
+  const timers = useRef([]);
+
+  useEffect(() => {
+    setPhase("idle");
+    setTicked(0);
+    onVerified(null);
+    return () => timers.current.forEach(clearTimeout);
+  }, [id]);
+
+  // The tab title follows the selection, so a pinned tab says which project.
+  useEffect(() => {
+    document.title = project ? `Phantom · ${project.shortName ?? project.name}` : "Phantom";
+    return () => { document.title = "Phantom"; };
+  }, [project]);
+
+  function run() {
+    setPhase("running");
+    setTicked(0);
+    timers.current.forEach(clearTimeout);
+    timers.current = COVARIATES.map((_, i) => setTimeout(() => setTicked(i + 1), 160 * (i + 1)));
+    timers.current.push(
+      setTimeout(() => {
+        setPhase("done");
+        onVerified(result.matches);
+      }, 160 * COVARIATES.length + 300)
+    );
   }
 
+  const { audit } = result;
   return (
-    <aside className="panel panel-right">
-      <div className="panel-head">
-        <div className="panel-title">Portfolio exposure</div>
-        <div className="panel-h1">{company.name}</div>
-        <div className="panel-sub">{company.sector} · {result.rows.length} projects · {fmtInt(result.totalCredits)} credits</div>
-        <div className="filter-row" style={{ marginTop: 11 }}>
-          {COMPANIES.map((c) => (
-            <button key={c.id} className="filter-btn" aria-pressed={c.id === companyId} onClick={() => setCompanyId(c.id)}>
-              {c.name.split(" ")[0]}
-            </button>
-          ))}
+    <aside className="panel side">
+      <div className="side-head">
+        <button className="btn btn-quiet" style={{ width: "auto", padding: "4px 9px", fontSize: 11.5 }} onClick={onClose}>
+          ← all projects
+        </button>
+        <div className="p-name" style={{ marginTop: 9 }}>{project.name}</div>
+        <div className="p-meta">{project.locality} · {project.country} · {compact(project.areaHa)} ha · start {project.startYear}</div>
+        <div className="tags">
+          <span className="tag" style={{ borderColor: audit.band.color + "66", color: audit.band.color }}>
+            {audit.band.label} baseline risk
+          </span>
         </div>
       </div>
-      <div className="panel-body">
-        <div className="section">
-          <p className="statement">
-            {company.name} spent <span className="num">{fmtMoney(result.totalSpend)}</span> on forest offsets.{" "}
-            <span className="num hl-red">{fmtMoney(result.totalUnsupported)}</span> of it bought nothing the
-            satellites can find.
-          </p>
-          <div style={{ marginTop: 13 }}><SplitBar supported={result.totalSpend - result.totalUnsupported} unsupported={result.totalUnsupported} /></div>
-          <div className="row" style={{ paddingBottom: 0 }}>
-            <span className="row-note">{fmtPct(1 - share)} supported</span>
-            <span className="row-note" style={{ color: "var(--danger)" }}>{fmtPct(share)} unsupported</span>
-          </div>
-        </div>
 
-        <table className="table">
-          <thead>
-            <tr><th>Project</th><th>Grade</th><th className="r">Spend · unsupported</th></tr>
-          </thead>
-          <tbody>
-            {result.rows.map((r) => (
-              <tr key={r.projectId + r.year} onClick={() => onSelect(r.projectId)}>
-                <td>
-                  <div>{projectById[r.projectId].name}</div>
-                  <div className="item-meta">{r.projectId} · {fmtInt(r.credits)} @ ${r.pricePerCredit.toFixed(2)} · {r.year}</div>
-                  <div style={{ marginTop: 6, maxWidth: 170 }}>
-                    <SplitBar supported={r.supported} unsupported={r.unsupported} />
-                  </div>
-                </td>
-                <td><Grade g={r.verdict.grade} /></td>
-                <td className="r">
-                  <div className="mono">{fmtCompact(r.spend)}</div>
-                  <div className="mono" style={{ color: "var(--danger)", fontSize: 11.5, marginTop: 2 }}>
-                    −{fmtCompact(r.unsupported)}
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-
-        <div className="section">
-          <button className="btn btn-accent btn-block" onClick={exportFindings}>Export findings (JSON)</button>
-          <div className="notice" style={{ marginTop: 9 }}>
-            Unsupported spend = spend × (1 − additionality) per project, additionality clamped to 0–100%.
-            Companies and purchase records are fictional; the grades behind them are measured.
+      <div className="side-body">
+        {phase !== "done" && (
+          <div className="sec">
+            <div className="stats">
+              <div className="stat"><div className="stat-k">Credits issued</div><div className="stat-v">{compact(project.creditsIssued)}</div></div>
+              <div className="stat"><div className="stat-k">Credits retired</div><div className="stat-v">{compact(project.creditsRetired)}</div></div>
+            </div>
+            {phase === "idle" ? (
+              <>
+                <button className="btn" style={{ marginTop: 14 }} onClick={run}>
+                  Run independent verification
+                </button>
+                <div className="notice" style={{ marginTop: 9 }}>
+                  Rebuilds the baseline from public satellite records and comparable unprotected forest.
+                </div>
+              </>
+            ) : (
+              <div className="btn" style={{ marginTop: 14, cursor: "default" }}>
+                <i className="spin" /> searching {CELLS.length} parcels
+              </div>
+            )}
           </div>
-        </div>
+        )}
+
+        <Verification result={result} phase={phase} ticked={ticked} />
+        {phase === "done" && (
+          <Results project={project} result={result} year={year} snapshotMap={snapshotMap} />
+        )}
       </div>
     </aside>
   );
 }
 
-/* ── bottom: legend ──────────────────────────────────────────────────────── */
-export function Legend({ selectedId }) {
+/* ── list, shown when nothing is selected ────────────────────────────────── */
+export function ProjectList({ onSelect }) {
+  useEffect(() => { document.title = "Phantom"; }, []);
   return (
-    <div className="legend">
-      <span className="legend-cap">Grade</span>
-      <span className="grade-ramp">
-        {GRADE_ORDER.map((g) => (
-          <span key={g} style={{ color: GRADE_COLORS[g], background: GRADE_COLORS[g] + "1c", border: `1px solid ${GRADE_COLORS[g]}55` }}>{g}</span>
-        ))}
-      </span>
-      <span className="legend-group"><i className="swatch" style={{ background: "#e5484d" }} />tree cover loss</span>
-      <span className="legend-group"><i className="swatch" style={{ background: "#4fa8d8", opacity: 0.5 }} />counterfactual ring</span>
-      <span className="legend-group"><i className="swatch" style={{ background: "#93a4b0", opacity: 0.35 }} />5 km cushion (excluded)</span>
-      {selectedId && (
-        <>
-          <span className="legend-group"><i className="swatch" style={{ background: "rgb(31,89,58)" }} />canopy standing</span>
-          <span className="legend-group"><i className="swatch" style={{ background: "linear-gradient(90deg,#e8b931,#e5484d)" }} />cleared {baseYear}–{endYear}</span>
-          <span className="legend-group"><i className="swatch" style={{ background: "rgb(110,88,62)" }} />cleared before {baseYear}</span>
-        </>
-      )}
+    <aside className="panel side">
+      <div className="side-head">
+        <div className="sec-title" style={{ marginBottom: 6 }}>Registered forest carbon projects</div>
+        <div className="notice">
+          Every credit rests on a prediction of what would have happened without the project — written
+          by the project itself. Pick one and Phantom rebuilds that prediction from public satellite
+          records and comparable unprotected forest.
+        </div>
+      </div>
+      <div className="side-body">
+        {[...PROJECTS]
+          .sort((a, b) => b.claimedBaselineLoss - a.claimedBaselineLoss)
+          .map((p) => (
+            <button key={p.id} className="sec" style={{ display: "block", width: "100%", textAlign: "left" }} onClick={() => onSelect(p.id)}>
+              <div className="p-name" style={{ fontSize: 14.5 }}>{p.name}</div>
+              <div className="p-meta" style={{ fontSize: 11.5 }}>
+                {p.locality} · {compact(p.creditsIssued)} credits · claims {pct(p.claimedBaselineLoss, 0)} loss
+              </div>
+            </button>
+          ))}
+      </div>
+    </aside>
+  );
+}
+
+/* ── settings, hidden behind the gear ────────────────────────────────────── */
+export function Settings({ open, layers, setLayers, onClose }) {
+  if (!open) return null;
+  const set = (k) => (v) => setLayers((l) => ({ ...l, [k]: v }));
+  const Toggle = ({ k, label, note }) => (
+    <div className="row">
+      <div>
+        <div className="row-label">{label}</div>
+        {note && <div className="row-note">{note}</div>}
+      </div>
+      <button role="switch" aria-checked={layers[k]} aria-label={label} className="switch" onClick={() => set(k)(!layers[k])} />
+    </div>
+  );
+  return (
+    <div className="panel pop" role="dialog" aria-label="Map and data settings">
+      <div className="sec">
+        <div className="sec-title">Map</div>
+        <Toggle k="labels" label="Place names" />
+        <Toggle k="controls" label="Comparable parcels" note="shown after a verification runs" />
+      </div>
+      <div className="sec">
+        <div className="sec-title">Data</div>
+        <div className="notice">
+          Deforestation: <a href="https://terrabrasilis.dpi.inpe.br" target="_blank" rel="noreferrer">INPE PRODES</a>,
+          the official Brazilian Amazon record — annual clear-cut increments, {REFERENCE_PERIOD[0]}–{WINDOW[1]}.
+          Terrain and rainfall: <a href="https://open-meteo.com" target="_blank" rel="noreferrer">Open-Meteo</a>.
+          Imagery: <a href="https://s2maps.eu" target="_blank" rel="noreferrer">Sentinel-2 cloudless by EOX</a>.
+          Place names © CARTO, OpenStreetMap.
+          <br /><br />
+          Project records, company names and credit volumes in this build are illustrative and describe
+          no real party. The deforestation measured under and around them is real.
+        </div>
+      </div>
+      <div className="sec">
+        <button className="btn btn-quiet" onClick={onClose}>Close</button>
+      </div>
     </div>
   );
 }
