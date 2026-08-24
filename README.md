@@ -10,7 +10,7 @@ without the project. The project writes that prediction itself, from a reference
 An auditor checks it was done to methodology, and a registry certifies it. Nobody routinely goes
 back and asks whether comparable forest actually behaved the way the baseline said it would.
 
-Phantom asks that question, from the outside, using public satellite records.
+Phantom asks that question, from the outside, using public satellite records..
 
 ---
 
